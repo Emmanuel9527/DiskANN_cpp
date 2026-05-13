@@ -3,6 +3,10 @@
 
 #pragma once
 
+// Controls symbol visibility when DiskANN is built or consumed as a Windows DLL.
+// Public C++ access controls who may call a member; this macro controls whether
+// the linker exports/imports the symbol across DLL boundaries. It is empty on
+// non-Windows platforms.
 #ifdef _WINDOWS
 
 #ifdef _WINDLL

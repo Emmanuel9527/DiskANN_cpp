@@ -32,11 +32,17 @@
 namespace diskann
 {
 
-inline double estimate_ram_usage(size_t size, uint32_t dim, uint32_t datasize, uint32_t degree)
+inline double estimate_ram_usage(size_t size, uint32_t dim, uint32_t datasize,
+                                 uint32_t degree) // degree = max out degree
 {
     double size_of_data = ((double)size) * ROUND_UP(dim, 8) * datasize;
+
+    // graph_slack_factor accounts for extra space in the graph
     double size_of_graph = ((double)size) * degree * sizeof(uint32_t) * defaults::GRAPH_SLACK_FACTOR;
+
     double size_of_locks = ((double)size) * sizeof(non_recursive_mutex);
+
+    // Approximate per-node overhead for the outer graph container.
     double size_of_outer_vector = ((double)size) * sizeof(ptrdiff_t);
 
     return OVERHEAD_FACTOR * (size_of_data + size_of_graph + size_of_locks + size_of_outer_vector);
@@ -53,13 +59,16 @@ template <typename T, typename TagT = uint32_t, typename LabelT = uint32_t> clas
      **************************************************************************/
 
   public:
-    // Constructor for Bulk operations and for creating the index object solely
-    // for loading a prexisting index.
+    // Builds an Index from explicit configuration and storage backends.
+    // Used by the factory path for bulk-build/load scenarios where the data,
+    // graph, and optional PQ stores are created outside this class.
     DISKANN_DLLEXPORT Index(const IndexConfig &index_config, std::shared_ptr<AbstractDataStore<T>> data_store,
                             std::unique_ptr<AbstractGraphStore> graph_store,
                             std::shared_ptr<AbstractDataStore<T>> pq_data_store = nullptr);
 
-    // Constructor for incremental index
+    // Builds an Index directly from metric, dimensionality, capacity, and
+    // build/search parameters. Used by incremental or dynamic index workflows
+    // that may enable tags, frozen points, inserts, deletes, or PQ distance build.
     DISKANN_DLLEXPORT Index(Metric m, const size_t dim, const size_t max_points,
                             const std::shared_ptr<IndexWriteParameters> index_parameters,
                             const std::shared_ptr<IndexSearchParams> index_search_params,
@@ -68,6 +77,8 @@ template <typename T, typename TagT = uint32_t, typename LabelT = uint32_t> clas
                             const bool pq_dist_build = false, const size_t num_pq_chunks = 0,
                             const bool use_opq = false, const bool filtered_index = false);
 
+    // Releases index-owned resources such as graph/data stores, scratch buffers,
+    // locks, and any auxiliary structures allocated during build or load.
     DISKANN_DLLEXPORT ~Index();
 
     // Saves graph, data, metadata and associated tags.
