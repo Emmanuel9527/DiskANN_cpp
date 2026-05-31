@@ -19,6 +19,8 @@
 #include "timer.h"
 #include "tsl/robin_set.h"
 
+#include <numeric>
+
 namespace diskann
 {
 
@@ -849,7 +851,9 @@ void create_disk_layout(const std::string base_file, const std::string mem_index
 {
     uint32_t npts, ndims;
 
-    // amount to read or write in one shot
+    // Read the base-vector file header. The base file stores vectors in node-id
+    // order, and this function preserves that order when it writes nodes to disk.
+    // The large cached block size keeps the sequential conversion throughput high.
     size_t read_blk_size = 64 * 1024 * 1024;
     size_t write_blk_size = read_blk_size;
     cached_ifstream base_reader(base_file, read_blk_size);
@@ -860,7 +864,9 @@ void create_disk_layout(const std::string base_file, const std::string mem_index
     npts_64 = npts;
     ndims_64 = ndims;
 
-    // Check if we need to append data for re-ordering
+    // Optional full-precision reorder data is appended after the graph sectors.
+    // This path is used when the disk graph stores compressed vectors but search
+    // still needs original float vectors for final reranking.
     bool append_reorder_data = false;
     std::ifstream reorder_data_reader;
 
@@ -889,13 +895,17 @@ void create_disk_layout(const std::string base_file, const std::string mem_index
         }
     }
 
-    // create cached reader + writer
+    // Open the in-memory Vamana graph and the final disk-index file. The Vamana
+    // graph supplies, for each node id, the neighbor count followed by neighbor
+    // ids; the disk index will interleave each node's vector with that graph data.
     size_t actual_file_size = get_file_size(mem_index_file);
     diskann::cout << "Vamana index file size=" << actual_file_size << std::endl;
     std::ifstream vamana_reader(mem_index_file, std::ios::binary);
     cached_ofstream diskann_writer(output_file, write_blk_size);
 
-    // metadata: width, medoid
+    // Read and validate the Vamana header. Width is the maximum graph degree
+    // reserved per node, medoid is the search entry point, and frozen metadata is
+    // propagated into the disk header for static-index compatibility.
     uint32_t width_u32, medoid_u32;
     size_t index_file_size;
 
@@ -914,7 +924,11 @@ void create_disk_layout(const std::string base_file, const std::string mem_index
     vamana_reader.read((char *)&width_u32, sizeof(uint32_t));
     vamana_reader.read((char *)&medoid_u32, sizeof(uint32_t));
     vamana_reader.read((char *)&vamana_frozen_num, sizeof(uint64_t));
-    // compute
+
+    // Compute the fixed on-disk node record size:
+    //   [vector coordinates][uint32_t neighbor_count][uint32_t neighbor ids...].
+    // If a fixed node record fits in one 4KB sector, several consecutive node ids
+    // are packed into the same sector. Otherwise, each node owns multiple sectors.
     uint64_t medoid, max_node_len, nnodes_per_sector;
     npts_64 = (uint64_t)npts;
     medoid = (uint64_t)medoid_u32;
@@ -927,19 +941,24 @@ void create_disk_layout(const std::string base_file, const std::string mem_index
     diskann::cout << "max_node_len: " << max_node_len << "B" << std::endl;
     diskann::cout << "nnodes_per_sector: " << nnodes_per_sector << "B" << std::endl;
 
-    // defaults::SECTOR_LEN buffer for each sector
+    // Scratch buffers used while materializing one sector or one multi-sector
+    // node. node_buf is laid out exactly like one fixed-size on-disk node record.
     std::unique_ptr<char[]> sector_buf = std::make_unique<char[]>(defaults::SECTOR_LEN);
     std::unique_ptr<char[]> multisector_buf = std::make_unique<char[]>(ROUND_UP(max_node_len, defaults::SECTOR_LEN));
     std::unique_ptr<char[]> node_buf = std::make_unique<char[]>(max_node_len);
     uint32_t &nnbrs = *(uint32_t *)(node_buf.get() + ndims_64 * sizeof(T));
     uint32_t *nhood_buf = (uint32_t *)(node_buf.get() + (ndims_64 * sizeof(T)) + sizeof(uint32_t));
 
-    // number of sectors (1 for meta data)
+    // Count graph sectors, excluding the 4KB metadata sector at file sector 0.
+    // With multi-node sectors, node ids are packed contiguously by id. With
+    // multi-sector nodes, every node gets the same rounded-up sector span.
     uint64_t n_sectors = nnodes_per_sector > 0 ? ROUND_UP(npts_64, nnodes_per_sector) / nnodes_per_sector
                                                : npts_64 * DIV_ROUND_UP(max_node_len, defaults::SECTOR_LEN);
     uint64_t n_reorder_sectors = 0;
     uint64_t n_data_nodes_per_sector = 0;
 
+    // If reorder data is present, compute how many full-precision float vectors
+    // fit in one 4KB sector and how many extra sectors the appended block needs.
     if (append_reorder_data)
     {
         n_data_nodes_per_sector = defaults::SECTOR_LEN / (ndims_reorder_file * sizeof(float));
@@ -947,6 +966,9 @@ void create_disk_layout(const std::string base_file, const std::string mem_index
     }
     uint64_t disk_index_file_size = (n_sectors + n_reorder_sectors + 1) * defaults::SECTOR_LEN;
 
+    // Prepare metadata written into sector 0. save_bin() overwrites this initial
+    // zero-filled sector after all graph and optional reorder sectors are flushed.
+    // Search reads these values to map a node id to its sector and in-sector offset.
     std::vector<uint64_t> output_file_meta;
     output_file_meta.push_back(npts_64);
     output_file_meta.push_back(ndims_64);
@@ -964,6 +986,7 @@ void create_disk_layout(const std::string base_file, const std::string mem_index
     }
     output_file_meta.push_back(disk_index_file_size);
 
+    // Reserve sector 0 for metadata so the first graph sector starts at sector 1.
     diskann_writer.write(sector_buf.get(), defaults::SECTOR_LEN);
 
     std::unique_ptr<T[]> cur_node_coords = std::make_unique<T[]>(ndims_64);
@@ -971,7 +994,10 @@ void create_disk_layout(const std::string base_file, const std::string mem_index
     uint64_t cur_node_id = 0;
 
     if (nnodes_per_sector > 0)
-    { // Write multiple nodes per sector
+    {
+        // Fast path for small node records: pack consecutive node ids into one
+        // sector. Sector s stores node ids:
+        //   [s * nnodes_per_sector, ..., (s + 1) * nnodes_per_sector - 1].
         for (uint64_t sector = 0; sector < n_sectors; sector++)
         {
             if (sector % 100000 == 0)
@@ -983,45 +1009,53 @@ void create_disk_layout(const std::string base_file, const std::string mem_index
                  sector_node_id++)
             {
                 memset(node_buf.get(), 0, max_node_len);
-                // read cur node's nnbrs
+
+                // Read this node's adjacency list from the Vamana graph. The
+                // graph file is already ordered by node id, matching base_reader.
                 vamana_reader.read((char *)&nnbrs, sizeof(uint32_t));
 
-                // sanity checks on nnbrs
+                // The disk node record reserves width_u32 neighbor slots; the
+                // current builder expects the stored degree to respect that width.
                 assert(nnbrs > 0);
                 assert(nnbrs <= width_u32);
 
-                // read node's nhood
+                // Copy the node's neighbors into the fixed node record. The
+                // branch is defensive for older or unexpected graph files with a
+                // larger degree than the reserved disk width.
                 vamana_reader.read((char *)nhood_buf, (std::min)(nnbrs, width_u32) * sizeof(uint32_t));
                 if (nnbrs > width_u32)
                 {
                     vamana_reader.seekg((nnbrs - width_u32) * sizeof(uint32_t), vamana_reader.cur);
                 }
 
-                // write coords of node first
-                //  T *node_coords = data + ((uint64_t) ndims_64 * cur_node_id);
+                // Read the vector for cur_node_id and place it at the beginning
+                // of the node record.
                 base_reader.read((char *)cur_node_coords.get(), sizeof(T) * ndims_64);
                 memcpy(node_buf.get(), cur_node_coords.get(), ndims_64 * sizeof(T));
 
-                // write nnbrs
+                // Store the adjacency length immediately after the vector bytes.
                 *(uint32_t *)(node_buf.get() + ndims_64 * sizeof(T)) = (std::min)(nnbrs, width_u32);
 
-                // write nhood next
+                // Store the neighbor ids after the adjacency length.
                 memcpy(node_buf.get() + ndims_64 * sizeof(T) + sizeof(uint32_t), nhood_buf,
                        (std::min)(nnbrs, width_u32) * sizeof(uint32_t));
 
-                // get offset into sector_buf
+                // Place this fixed-size node record at its id-derived slot inside
+                // the current sector.
                 char *sector_node_buf = sector_buf.get() + (sector_node_id * max_node_len);
-
-                // copy node buf into sector_node_buf
                 memcpy(sector_node_buf, node_buf.get(), max_node_len);
                 cur_node_id++;
             }
-            // flush sector to disk
+
+            // Flush one complete 4KB graph sector.
             diskann_writer.write(sector_buf.get(), defaults::SECTOR_LEN);
         }
     }
     else
-    { // Write multi-sector nodes
+    {
+        // Slow path for large node records: each node record is padded up to a
+        // whole number of sectors, and node i starts at:
+        //   sector 1 + i * DIV_ROUND_UP(max_node_len, SECTOR_LEN).
         uint64_t nsectors_per_node = DIV_ROUND_UP(max_node_len, defaults::SECTOR_LEN);
         for (uint64_t i = 0; i < npts_64; i++)
         {
@@ -1032,39 +1066,41 @@ void create_disk_layout(const std::string base_file, const std::string mem_index
             memset(multisector_buf.get(), 0, nsectors_per_node * defaults::SECTOR_LEN);
 
             memset(node_buf.get(), 0, max_node_len);
-            // read cur node's nnbrs
+
+            // Read this node's adjacency list from the Vamana graph.
             vamana_reader.read((char *)&nnbrs, sizeof(uint32_t));
 
-            // sanity checks on nnbrs
+            // The disk node record reserves width_u32 neighbor slots.
             assert(nnbrs > 0);
             assert(nnbrs <= width_u32);
 
-            // read node's nhood
+            // Copy neighbor ids into the fixed record and skip any unexpected
+            // overflow neighbors.
             vamana_reader.read((char *)nhood_buf, (std::min)(nnbrs, width_u32) * sizeof(uint32_t));
             if (nnbrs > width_u32)
             {
                 vamana_reader.seekg((nnbrs - width_u32) * sizeof(uint32_t), vamana_reader.cur);
             }
 
-            // write coords of node first
-            //  T *node_coords = data + ((uint64_t) ndims_64 * cur_node_id);
+            // Materialize the node as [coords][nnbrs][neighbors] at the start of
+            // the padded multi-sector buffer.
             base_reader.read((char *)cur_node_coords.get(), sizeof(T) * ndims_64);
             memcpy(multisector_buf.get(), cur_node_coords.get(), ndims_64 * sizeof(T));
 
-            // write nnbrs
             *(uint32_t *)(multisector_buf.get() + ndims_64 * sizeof(T)) = (std::min)(nnbrs, width_u32);
 
-            // write nhood next
             memcpy(multisector_buf.get() + ndims_64 * sizeof(T) + sizeof(uint32_t), nhood_buf,
                    (std::min)(nnbrs, width_u32) * sizeof(uint32_t));
 
-            // flush sector to disk
+            // Flush the node's full padded sector range.
             diskann_writer.write(multisector_buf.get(), nsectors_per_node * defaults::SECTOR_LEN);
         }
     }
 
     if (append_reorder_data)
     {
+        // Append the original float vectors for reranking. This block is separate
+        // from the graph-layout block; it is also packed sequentially by node id.
         diskann::cout << "Index written. Appending reorder data..." << std::endl;
 
         auto vec_len = ndims_reorder_file * sizeof(float);
@@ -1085,16 +1121,383 @@ void create_disk_layout(const std::string base_file, const std::string mem_index
                 memset(vec_buf.get(), 0, vec_len);
                 reorder_data_reader.read(vec_buf.get(), vec_len);
 
-                // copy node buf into sector_node_buf
+                // Place one reranking vector at its sequential slot in the
+                // current reorder-data sector.
                 memcpy(sector_buf.get() + (sector_node_id * vec_len), vec_buf.get(), vec_len);
             }
-            // flush sector to disk
+
+            // Flush one 4KB reorder-data sector.
             diskann_writer.write(sector_buf.get(), defaults::SECTOR_LEN);
         }
     }
     diskann_writer.close();
+
+    // Finally write the metadata payload into sector 0. The data sectors were
+    // already written after the reserved header sector, so this does not disturb
+    // the graph layout.
     diskann::save_bin<uint64_t>(output_file, output_file_meta.data(), output_file_meta.size(), 1, 0);
     diskann::cout << "Output disk index file written to " << output_file << std::endl;
+}
+
+static double calculate_block_locality_ratio(const std::vector<std::vector<uint32_t>> &graph,
+                                             const std::vector<uint32_t> &vertex_to_block)
+{
+    uint64_t total_edges = 0;
+    uint64_t local_edges = 0;
+
+    for (uint32_t u = 0; u < graph.size(); u++)
+    {
+        for (const auto v : graph[u])
+        {
+            total_edges++;
+            if (vertex_to_block[u] == vertex_to_block[v])
+                local_edges++;
+        }
+    }
+
+    return total_edges == 0 ? 0.0 : (double)local_edges / (double)total_edges;
+}
+
+static std::vector<uint32_t> compute_block_shuffled_order(const std::vector<std::vector<uint32_t>> &graph,
+                                                          const uint64_t block_capacity,
+                                                          const uint32_t max_iterations,
+                                                          const double gain_threshold)
+{
+    const uint32_t npts = (uint32_t)graph.size();
+    std::vector<uint32_t> new_to_old(npts);
+    std::iota(new_to_old.begin(), new_to_old.end(), 0);
+
+    if (npts == 0 || block_capacity == 0 || max_iterations == 0)
+        return new_to_old;
+
+    const uint32_t num_blocks = (uint32_t)DIV_ROUND_UP((uint64_t)npts, block_capacity);
+    std::vector<std::vector<uint32_t>> blocks(num_blocks);
+    std::vector<uint32_t> vertex_to_block(npts);
+    std::vector<uint32_t> next_vertex_to_block(npts);
+    std::vector<uint32_t> block_neighbor_counts(num_blocks, 0);
+    std::vector<uint32_t> touched_blocks;
+    touched_blocks.reserve(num_blocks);
+
+    for (uint32_t u = 0; u < npts; u++)
+        vertex_to_block[u] = (uint32_t)((uint64_t)u / block_capacity);
+
+    double previous_ratio = calculate_block_locality_ratio(graph, vertex_to_block);
+
+    for (uint32_t iter = 0; iter < max_iterations; iter++)
+    {
+        for (auto &block : blocks)
+            block.clear();
+
+        for (uint32_t u = 0; u < npts; u++)
+        {
+            touched_blocks.clear();
+            for (const auto v : graph[u])
+            {
+                const uint32_t neighbor_block = vertex_to_block[v];
+                if (block_neighbor_counts[neighbor_block] == 0)
+                    touched_blocks.push_back(neighbor_block);
+                block_neighbor_counts[neighbor_block]++;
+            }
+
+            bool placed = false;
+            while (!placed)
+            {
+                uint32_t best_block = num_blocks;
+                uint32_t best_count = 0;
+                for (const auto block_id : touched_blocks)
+                {
+                    if (block_neighbor_counts[block_id] > best_count)
+                    {
+                        best_count = block_neighbor_counts[block_id];
+                        best_block = block_id;
+                    }
+                }
+
+                if (best_block == num_blocks)
+                    break;
+
+                if (blocks[best_block].size() < block_capacity)
+                {
+                    blocks[best_block].push_back(u);
+                    placed = true;
+                }
+
+                block_neighbor_counts[best_block] = 0;
+            }
+
+            if (!placed)
+            {
+                uint32_t target_block = num_blocks;
+                for (uint32_t block_id = 0; block_id < num_blocks; block_id++)
+                {
+                    if (blocks[block_id].empty())
+                    {
+                        target_block = block_id;
+                        break;
+                    }
+                }
+
+                if (target_block == num_blocks)
+                {
+                    for (uint32_t block_id = 0; block_id < num_blocks; block_id++)
+                    {
+                        if (blocks[block_id].size() < block_capacity)
+                        {
+                            target_block = block_id;
+                            break;
+                        }
+                    }
+                }
+
+                assert(target_block != num_blocks);
+                blocks[target_block].push_back(u);
+            }
+
+            for (const auto block_id : touched_blocks)
+                block_neighbor_counts[block_id] = 0;
+        }
+
+        for (uint32_t block_id = 0; block_id < num_blocks; block_id++)
+        {
+            for (const auto u : blocks[block_id])
+                next_vertex_to_block[u] = block_id;
+        }
+
+        const double current_ratio = calculate_block_locality_ratio(graph, next_vertex_to_block);
+        const double gain = current_ratio - previous_ratio;
+        diskann::cout << "Block shuffling iteration " << iter + 1 << ": locality ratio=" << current_ratio
+                      << ", gain=" << gain << std::endl;
+
+        vertex_to_block.swap(next_vertex_to_block);
+        previous_ratio = current_ratio;
+
+        if (gain < gain_threshold)
+            break;
+    }
+
+    uint32_t new_id = 0;
+    for (const auto &block : blocks)
+    {
+        for (const auto old_id : block)
+            new_to_old[new_id++] = old_id;
+    }
+    assert(new_id == npts);
+
+    return new_to_old;
+}
+
+template <typename T>
+void create_disk_layout_block_shuffling(const std::string base_file, const std::string mem_index_file,
+                                        const std::string output_file, const std::string reorder_data_file,
+                                        const uint32_t max_iterations, const double gain_threshold)
+{
+    uint32_t npts, ndims;
+    const size_t write_blk_size = 64 * 1024 * 1024;
+
+    std::ifstream base_reader(base_file, std::ios::binary);
+    base_reader.exceptions(std::ifstream::failbit | std::ifstream::badbit);
+    base_reader.read((char *)&npts, sizeof(uint32_t));
+    base_reader.read((char *)&ndims, sizeof(uint32_t));
+
+    const uint64_t npts_64 = (uint64_t)npts;
+    const uint64_t ndims_64 = (uint64_t)ndims;
+
+    bool append_reorder_data = false;
+    std::ifstream reorder_data_reader;
+    uint32_t npts_reorder_file = 0, ndims_reorder_file = 0;
+    if (reorder_data_file != std::string(""))
+    {
+        append_reorder_data = true;
+        const size_t reorder_data_file_size = get_file_size(reorder_data_file);
+        reorder_data_reader.exceptions(std::ifstream::failbit | std::ifstream::badbit);
+        reorder_data_reader.open(reorder_data_file, std::ios::binary);
+        reorder_data_reader.read((char *)&npts_reorder_file, sizeof(uint32_t));
+        reorder_data_reader.read((char *)&ndims_reorder_file, sizeof(uint32_t));
+
+        if (npts_reorder_file != npts)
+            throw ANNException("Mismatch in num_points between reorder data file and base file", -1, __FUNCSIG__,
+                               __FILE__, __LINE__);
+        if (reorder_data_file_size != 8 + sizeof(float) * (size_t)npts_reorder_file * (size_t)ndims_reorder_file)
+            throw ANNException("Discrepancy in reorder data file size ", -1, __FUNCSIG__, __FILE__, __LINE__);
+    }
+
+    const size_t actual_file_size = get_file_size(mem_index_file);
+    diskann::cout << "Vamana index file size=" << actual_file_size << std::endl;
+    std::ifstream vamana_reader(mem_index_file, std::ios::binary);
+    vamana_reader.exceptions(std::ifstream::failbit | std::ifstream::badbit);
+
+    uint32_t width_u32, medoid_u32;
+    uint64_t index_file_size;
+    vamana_reader.read((char *)&index_file_size, sizeof(uint64_t));
+    if (index_file_size != actual_file_size)
+    {
+        std::stringstream stream;
+        stream << "Vamana Index file size does not match expected size per meta-data."
+               << " file size from file: " << index_file_size << " actual file size: " << actual_file_size
+               << std::endl;
+        throw diskann::ANNException(stream.str(), -1, __FUNCSIG__, __FILE__, __LINE__);
+    }
+
+    uint64_t vamana_frozen_num = false, vamana_frozen_loc = 0;
+    vamana_reader.read((char *)&width_u32, sizeof(uint32_t));
+    vamana_reader.read((char *)&medoid_u32, sizeof(uint32_t));
+    vamana_reader.read((char *)&vamana_frozen_num, sizeof(uint64_t));
+
+    std::vector<std::vector<uint32_t>> graph(npts);
+    for (uint32_t u = 0; u < npts; u++)
+    {
+        uint32_t nnbrs;
+        vamana_reader.read((char *)&nnbrs, sizeof(uint32_t));
+        if (nnbrs > width_u32)
+        {
+            std::stringstream stream;
+            stream << "Node " << u << " has degree " << nnbrs << " greater than index width " << width_u32
+                   << std::endl;
+            throw diskann::ANNException(stream.str(), -1, __FUNCSIG__, __FILE__, __LINE__);
+        }
+
+        graph[u].resize(nnbrs);
+        if (nnbrs > 0)
+            vamana_reader.read((char *)graph[u].data(), nnbrs * sizeof(uint32_t));
+
+        for (const auto v : graph[u])
+        {
+            if (v >= npts)
+            {
+                std::stringstream stream;
+                stream << "Node " << u << " has out-of-range neighbor " << v << " for npts=" << npts << std::endl;
+                throw diskann::ANNException(stream.str(), -1, __FUNCSIG__, __FILE__, __LINE__);
+            }
+        }
+    }
+
+    uint64_t medoid = (uint64_t)medoid_u32;
+    if (vamana_frozen_num == 1)
+        vamana_frozen_loc = medoid;
+
+    const uint64_t max_node_len = (((uint64_t)width_u32 + 1) * sizeof(uint32_t)) + (ndims_64 * sizeof(T));
+    const uint64_t nnodes_per_sector = defaults::SECTOR_LEN / max_node_len;
+
+    if (nnodes_per_sector == 0)
+    {
+        diskann::cout << "Block shuffling disabled because each node spans multiple sectors." << std::endl;
+        create_disk_layout<T>(base_file, mem_index_file, output_file, reorder_data_file);
+        return;
+    }
+
+    std::vector<uint32_t> new_to_old =
+        compute_block_shuffled_order(graph, nnodes_per_sector, max_iterations, gain_threshold);
+    std::vector<uint32_t> old_to_new(npts);
+    for (uint32_t new_id = 0; new_id < npts; new_id++)
+        old_to_new[new_to_old[new_id]] = new_id;
+
+    medoid = old_to_new[(uint32_t)medoid];
+    if (vamana_frozen_num == 1)
+        vamana_frozen_loc = medoid;
+
+    const uint64_t n_sectors = ROUND_UP(npts_64, nnodes_per_sector) / nnodes_per_sector;
+    uint64_t n_reorder_sectors = 0;
+    uint64_t n_data_nodes_per_sector = 0;
+    if (append_reorder_data)
+    {
+        n_data_nodes_per_sector = defaults::SECTOR_LEN / (ndims_reorder_file * sizeof(float));
+        n_reorder_sectors = ROUND_UP(npts_64, n_data_nodes_per_sector) / n_data_nodes_per_sector;
+    }
+    const uint64_t disk_index_file_size = (n_sectors + n_reorder_sectors + 1) * defaults::SECTOR_LEN;
+
+    std::vector<uint64_t> output_file_meta;
+    output_file_meta.push_back(npts_64);
+    output_file_meta.push_back(ndims_64);
+    output_file_meta.push_back(medoid);
+    output_file_meta.push_back(max_node_len);
+    output_file_meta.push_back(nnodes_per_sector);
+    output_file_meta.push_back(vamana_frozen_num);
+    output_file_meta.push_back(vamana_frozen_loc);
+    output_file_meta.push_back((uint64_t)append_reorder_data);
+    if (append_reorder_data)
+    {
+        output_file_meta.push_back(n_sectors + 1);
+        output_file_meta.push_back(ndims_reorder_file);
+        output_file_meta.push_back(n_data_nodes_per_sector);
+    }
+    output_file_meta.push_back(disk_index_file_size);
+
+    cached_ofstream diskann_writer(output_file, write_blk_size);
+    std::unique_ptr<char[]> sector_buf = std::make_unique<char[]>(defaults::SECTOR_LEN);
+    std::unique_ptr<char[]> node_buf = std::make_unique<char[]>(max_node_len);
+    std::unique_ptr<T[]> cur_node_coords = std::make_unique<T[]>(ndims_64);
+    uint32_t &nnbrs = *(uint32_t *)(node_buf.get() + ndims_64 * sizeof(T));
+    uint32_t *nhood_buf = (uint32_t *)(node_buf.get() + (ndims_64 * sizeof(T)) + sizeof(uint32_t));
+
+    memset(sector_buf.get(), 0, defaults::SECTOR_LEN);
+    diskann_writer.write(sector_buf.get(), defaults::SECTOR_LEN);
+
+    diskann::cout << "# sectors: " << n_sectors << std::endl;
+    uint32_t new_id = 0;
+    const uint64_t base_data_start = 2 * sizeof(uint32_t);
+    const uint64_t base_vector_len = ndims_64 * sizeof(T);
+
+    for (uint64_t sector = 0; sector < n_sectors; sector++)
+    {
+        if (sector % 100000 == 0)
+            diskann::cout << "Block-shuffled sector #" << sector << " written" << std::endl;
+
+        memset(sector_buf.get(), 0, defaults::SECTOR_LEN);
+        for (uint64_t sector_node_id = 0; sector_node_id < nnodes_per_sector && new_id < npts; sector_node_id++)
+        {
+            const uint32_t old_id = new_to_old[new_id];
+            memset(node_buf.get(), 0, max_node_len);
+
+            base_reader.seekg(base_data_start + (uint64_t)old_id * base_vector_len, std::ios::beg);
+            base_reader.read((char *)cur_node_coords.get(), base_vector_len);
+            memcpy(node_buf.get(), cur_node_coords.get(), base_vector_len);
+
+            nnbrs = (uint32_t)graph[old_id].size();
+            for (uint32_t j = 0; j < nnbrs; j++)
+                nhood_buf[j] = old_to_new[graph[old_id][j]];
+
+            char *sector_node_buf = sector_buf.get() + (sector_node_id * max_node_len);
+            memcpy(sector_node_buf, node_buf.get(), max_node_len);
+            new_id++;
+        }
+
+        diskann_writer.write(sector_buf.get(), defaults::SECTOR_LEN);
+    }
+
+    if (append_reorder_data)
+    {
+        diskann::cout << "Index written. Appending block-shuffled reorder data..." << std::endl;
+
+        const uint64_t vec_len = ndims_reorder_file * sizeof(float);
+        const uint64_t reorder_data_start = 2 * sizeof(uint32_t);
+        std::unique_ptr<char[]> vec_buf = std::make_unique<char[]>(vec_len);
+        uint32_t reorder_new_id = 0;
+
+        for (uint64_t sector = 0; sector < n_reorder_sectors; sector++)
+        {
+            if (sector % 100000 == 0)
+                diskann::cout << "Block-shuffled reorder data sector #" << sector << " written" << std::endl;
+
+            memset(sector_buf.get(), 0, defaults::SECTOR_LEN);
+            for (uint64_t sector_node_id = 0; sector_node_id < n_data_nodes_per_sector && reorder_new_id < npts;
+                 sector_node_id++)
+            {
+                const uint32_t old_id = new_to_old[reorder_new_id];
+                reorder_data_reader.seekg(reorder_data_start + (uint64_t)old_id * vec_len, std::ios::beg);
+                reorder_data_reader.read(vec_buf.get(), vec_len);
+                memcpy(sector_buf.get() + (sector_node_id * vec_len), vec_buf.get(), vec_len);
+                reorder_new_id++;
+            }
+
+            diskann_writer.write(sector_buf.get(), defaults::SECTOR_LEN);
+        }
+    }
+
+    diskann_writer.close();
+    diskann::save_bin<uint64_t>(output_file, output_file_meta.data(), output_file_meta.size(), 1, 0);
+    diskann::save_bin<uint32_t>(output_file + "_block_shuffle_old_to_new.bin", old_to_new.data(), old_to_new.size(), 1);
+    diskann::save_bin<uint32_t>(output_file + "_block_shuffle_new_to_old.bin", new_to_old.data(), new_to_old.size(), 1);
+    diskann::cout << "Block-shuffled disk index file written to " << output_file << std::endl;
 }
 
 template <typename T, typename LabelT>
@@ -1387,6 +1790,25 @@ template DISKANN_DLLEXPORT void create_disk_layout<uint8_t>(const std::string ba
 template DISKANN_DLLEXPORT void create_disk_layout<float>(const std::string base_file, const std::string mem_index_file,
                                                           const std::string output_file,
                                                           const std::string reorder_data_file);
+
+template DISKANN_DLLEXPORT void create_disk_layout_block_shuffling<int8_t>(const std::string base_file,
+                                                                           const std::string mem_index_file,
+                                                                           const std::string output_file,
+                                                                           const std::string reorder_data_file,
+                                                                           const uint32_t max_iterations,
+                                                                           const double gain_threshold);
+template DISKANN_DLLEXPORT void create_disk_layout_block_shuffling<uint8_t>(const std::string base_file,
+                                                                            const std::string mem_index_file,
+                                                                            const std::string output_file,
+                                                                            const std::string reorder_data_file,
+                                                                            const uint32_t max_iterations,
+                                                                            const double gain_threshold);
+template DISKANN_DLLEXPORT void create_disk_layout_block_shuffling<float>(const std::string base_file,
+                                                                          const std::string mem_index_file,
+                                                                          const std::string output_file,
+                                                                          const std::string reorder_data_file,
+                                                                          const uint32_t max_iterations,
+                                                                          const double gain_threshold);
 
 template DISKANN_DLLEXPORT int8_t *load_warmup<int8_t>(const std::string &cache_warmup_file, uint64_t &warmup_num,
                                                        uint64_t warmup_dim, uint64_t warmup_aligned_dim);
