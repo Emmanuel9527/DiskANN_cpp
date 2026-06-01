@@ -112,6 +112,7 @@ DISKANN_DLLEXPORT void create_disk_layout_block_shuffling(const std::string base
                                                           const std::string output_file,
                                                           const std::string reorder_data_file = std::string(""),
                                                           const uint32_t max_iterations = 3,
-                                                          const double gain_threshold = 0.0);
+                                                          const double gain_threshold = 0.0,
+                                                          const bool reorder_pq_compressed = false);
 
 } // namespace diskann

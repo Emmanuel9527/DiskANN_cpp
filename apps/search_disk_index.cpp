@@ -56,7 +56,7 @@ int search_disk_index(diskann::Metric &metric, const std::string &index_path_pre
                       const uint32_t num_nodes_to_cache, const uint32_t search_io_limit,
                       const std::vector<uint32_t> &Lvec, const float fail_if_recall_below,
                       const std::vector<std::string> &query_filters, const uint32_t progress_interval,
-                      const bool use_reorder_data = false)
+                      const std::string &result_new_to_old_map_file, const bool use_reorder_data = false)
 {
     diskann::cout << "Search parameters: #threads: " << num_threads << ", ";
     if (beamwidth <= 0)
@@ -99,6 +99,21 @@ int search_disk_index(diskann::Metric &metric, const std::string &index_path_pre
             diskann::cout << "Error. Mismatch in number of queries and ground truth data" << std::endl;
         }
         calc_recall_flag = true;
+    }
+
+    std::unique_ptr<uint32_t[]> result_new_to_old;
+    size_t map_npts = 0, map_ndim = 0;
+    const bool remap_results_for_recall = result_new_to_old_map_file != std::string("");
+    if (remap_results_for_recall)
+    {
+        diskann::load_bin<uint32_t>(result_new_to_old_map_file, result_new_to_old, map_npts, map_ndim);
+        if (map_ndim != 1)
+        {
+            diskann::cout << "Error. result_new_to_old_map must have dim 1" << std::endl;
+            return -1;
+        }
+        diskann::cout << "Loaded result new-to-old map with " << map_npts << " entries from "
+                      << result_new_to_old_map_file << std::endl;
     }
 
     std::shared_ptr<AlignedFileReader> reader = nullptr;
@@ -179,19 +194,19 @@ int search_disk_index(diskann::Metric &metric, const std::string &index_path_pre
     diskann::cout.setf(std::ios_base::fixed, std::ios_base::floatfield);
     diskann::cout.precision(2);
 
-    std::string recall_string = "Recall@" + std::to_string(recall_at);
-    diskann::cout << std::setw(6) << "L" << std::setw(12) << "Beamwidth" << std::setw(16) << "QPS" << std::setw(16)
-                  << "Mean Latency" << std::setw(16) << "99.9 Latency" << std::setw(16) << "Mean IOs" << std::setw(16)
-                  << "Mean IO (us)" << std::setw(16) << "CPU (s)";
-    if (calc_recall_flag)
+    struct SearchRunSummary
     {
-        diskann::cout << std::setw(16) << recall_string << std::endl;
-    }
-    else
-        diskann::cout << std::endl;
-    diskann::cout << "=================================================================="
-                     "================================================================="
-                  << std::endl;
+        uint32_t L;
+        uint32_t beamwidth;
+        double qps;
+        double mean_latency;
+        double latency_999;
+        double mean_ios;
+        double mean_io_us;
+        double mean_cpuus;
+        double recall;
+    };
+    std::vector<SearchRunSummary> search_summaries;
 
     std::vector<std::vector<uint32_t>> query_result_ids(Lvec.size());
     std::vector<std::vector<float>> query_result_dists(Lvec.size());
@@ -278,6 +293,20 @@ int search_disk_index(diskann::Metric &metric, const std::string &index_path_pre
 
         diskann::convert_types<uint64_t, uint32_t>(query_result_ids_64.data(), query_result_ids[test_id].data(),
                                                    query_num, recall_at);
+        if (remap_results_for_recall)
+        {
+            for (size_t result_id = 0; result_id < query_num * recall_at; result_id++)
+            {
+                const uint32_t new_id = query_result_ids[test_id][result_id];
+                if (new_id >= map_npts)
+                {
+                    diskann::cout << "Error. Search result id " << new_id << " is outside new-to-old map size "
+                                  << map_npts << std::endl;
+                    return -1;
+                }
+                query_result_ids[test_id][result_id] = result_new_to_old[new_id];
+            }
+        }
 
         auto mean_latency = diskann::get_mean_stats<float>(
             stats, query_num, [](const diskann::QueryStats &stats) { return stats.total_us; });
@@ -302,16 +331,36 @@ int search_disk_index(diskann::Metric &metric, const std::string &index_path_pre
             best_recall = std::max(recall, best_recall);
         }
 
-        diskann::cout << std::setw(6) << L << std::setw(12) << optimized_beamwidth << std::setw(16) << qps
-                      << std::setw(16) << mean_latency << std::setw(16) << latency_999 << std::setw(16) << mean_ios
-                      << std::setw(16) << mean_io_us << std::setw(16) << mean_cpuus;
+        search_summaries.push_back(
+            {L, optimized_beamwidth, qps, mean_latency, latency_999, mean_ios, mean_io_us, mean_cpuus, recall});
+        delete[] stats;
+    }
+
+    std::string recall_string = "Recall@" + std::to_string(recall_at);
+    diskann::cout << std::setw(6) << "L" << std::setw(12) << "Beamwidth" << std::setw(16) << "QPS" << std::setw(16)
+                  << "Mean Latency" << std::setw(16) << "99.9 Latency" << std::setw(16) << "Mean IOs" << std::setw(16)
+                  << "Mean IO (us)" << std::setw(16) << "CPU (s)";
+    if (calc_recall_flag)
+    {
+        diskann::cout << std::setw(16) << recall_string << std::endl;
+    }
+    else
+        diskann::cout << std::endl;
+    diskann::cout << "=================================================================="
+                     "================================================================="
+                  << std::endl;
+    for (const auto &summary : search_summaries)
+    {
+        diskann::cout << std::setw(6) << summary.L << std::setw(12) << summary.beamwidth << std::setw(16)
+                      << summary.qps << std::setw(16) << summary.mean_latency << std::setw(16)
+                      << summary.latency_999 << std::setw(16) << summary.mean_ios << std::setw(16)
+                      << summary.mean_io_us << std::setw(16) << summary.mean_cpuus;
         if (calc_recall_flag)
         {
-            diskann::cout << std::setw(16) << recall << std::endl;
+            diskann::cout << std::setw(16) << summary.recall << std::endl;
         }
         else
             diskann::cout << std::endl;
-        delete[] stats;
     }
 
     diskann::cout << "Done searching. Now saving results " << std::endl;
@@ -337,7 +386,7 @@ int search_disk_index(diskann::Metric &metric, const std::string &index_path_pre
 int main(int argc, char **argv)
 {
     std::string data_type, dist_fn, index_path_prefix, result_path_prefix, query_file, gt_file, filter_label,
-        label_type, query_filters_file;
+        label_type, query_filters_file, result_new_to_old_map_file;
     uint32_t num_threads, K, W, num_nodes_to_cache, search_io_limit, progress_interval;
     std::vector<uint32_t> Lvec;
     bool use_reorder_data = false;
@@ -400,6 +449,10 @@ int main(int argc, char **argv)
                                        po::value<uint32_t>(&progress_interval)->default_value(0),
                                        "Print search progress after this many completed queries for each L. "
                                        "Set to 0 to disable progress logging.");
+        optional_configs.add_options()("result_new_to_old_map",
+                                       po::value<std::string>(&result_new_to_old_map_file)->default_value(""),
+                                       "Optional uint32 bin map from result ids to original ids. Use this when the "
+                                       "disk layout renumbers nodes, e.g. block-shuffled indexes.");
 
         // Merge required and optional parameters
         desc.add(required_configs).add(optional_configs);
@@ -480,17 +533,17 @@ int main(int argc, char **argv)
                 return search_disk_index<float, uint16_t>(
                     metric, index_path_prefix, result_path_prefix, query_file, gt_file, num_threads, K, W,
                     num_nodes_to_cache, search_io_limit, Lvec, fail_if_recall_below, query_filters, progress_interval,
-                    use_reorder_data);
+                    result_new_to_old_map_file, use_reorder_data);
             else if (data_type == std::string("int8"))
                 return search_disk_index<int8_t, uint16_t>(
                     metric, index_path_prefix, result_path_prefix, query_file, gt_file, num_threads, K, W,
                     num_nodes_to_cache, search_io_limit, Lvec, fail_if_recall_below, query_filters, progress_interval,
-                    use_reorder_data);
+                    result_new_to_old_map_file, use_reorder_data);
             else if (data_type == std::string("uint8"))
                 return search_disk_index<uint8_t, uint16_t>(
                     metric, index_path_prefix, result_path_prefix, query_file, gt_file, num_threads, K, W,
                     num_nodes_to_cache, search_io_limit, Lvec, fail_if_recall_below, query_filters, progress_interval,
-                    use_reorder_data);
+                    result_new_to_old_map_file, use_reorder_data);
             else
             {
                 std::cerr << "Unsupported data type. Use float or int8 or uint8" << std::endl;
@@ -503,17 +556,17 @@ int main(int argc, char **argv)
                 return search_disk_index<float>(metric, index_path_prefix, result_path_prefix, query_file, gt_file,
                                                 num_threads, K, W, num_nodes_to_cache, search_io_limit, Lvec,
                                                 fail_if_recall_below, query_filters, progress_interval,
-                                                use_reorder_data);
+                                                result_new_to_old_map_file, use_reorder_data);
             else if (data_type == std::string("int8"))
                 return search_disk_index<int8_t>(metric, index_path_prefix, result_path_prefix, query_file, gt_file,
                                                  num_threads, K, W, num_nodes_to_cache, search_io_limit, Lvec,
                                                  fail_if_recall_below, query_filters, progress_interval,
-                                                 use_reorder_data);
+                                                 result_new_to_old_map_file, use_reorder_data);
             else if (data_type == std::string("uint8"))
                 return search_disk_index<uint8_t>(metric, index_path_prefix, result_path_prefix, query_file, gt_file,
                                                   num_threads, K, W, num_nodes_to_cache, search_io_limit, Lvec,
                                                   fail_if_recall_below, query_filters, progress_interval,
-                                                  use_reorder_data);
+                                                  result_new_to_old_map_file, use_reorder_data);
             else
             {
                 std::cerr << "Unsupported data type. Use float or int8 or uint8" << std::endl;

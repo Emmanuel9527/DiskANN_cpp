@@ -14,14 +14,14 @@
 #include "cached_io.h"
 
 template <typename T> int create_disk_layout(char **argv, bool use_block_shuffling, uint32_t max_iterations,
-                                             double gain_threshold)
+                                             double gain_threshold, bool reorder_pq_compressed)
 {
     std::string base_file(argv[2]);
     std::string vamana_file(argv[3]);
     std::string output_file(argv[4]);
     if (use_block_shuffling)
         diskann::create_disk_layout_block_shuffling<T>(base_file, vamana_file, output_file, std::string(""),
-                                                       max_iterations, gain_threshold);
+                                                       max_iterations, gain_threshold, reorder_pq_compressed);
     else
         diskann::create_disk_layout<T>(base_file, vamana_file, output_file);
     return 0;
@@ -29,17 +29,18 @@ template <typename T> int create_disk_layout(char **argv, bool use_block_shuffli
 
 int main(int argc, char **argv)
 {
-    if (argc != 5 && argc != 6 && argc != 7 && argc != 8)
+    if (argc != 5 && argc != 6 && argc != 7 && argc != 8 && argc != 9)
     {
         std::cout << argv[0]
                   << " data_type <float/int8/uint8> data_bin "
                      "vamana_index_file output_diskann_index_file "
-                     "[layout_mode <default/block_shuffle>] [max_iterations] [gain_threshold]"
+                     "[layout_mode <default/block_shuffle>] [max_iterations] [gain_threshold] [reorder_pq]"
                   << std::endl;
         exit(-1);
     }
 
     bool use_block_shuffling = false;
+    bool reorder_pq_compressed = false;
     uint32_t max_iterations = 3;
     double gain_threshold = 0.0;
     if (argc >= 6)
@@ -57,14 +58,28 @@ int main(int argc, char **argv)
         max_iterations = (uint32_t)std::stoul(argv[6]);
     if (argc >= 8)
         gain_threshold = std::stod(argv[7]);
+    if (argc >= 9)
+    {
+        const std::string pq_mode(argv[8]);
+        if (pq_mode == "reorder_pq")
+            reorder_pq_compressed = true;
+        else if (pq_mode != "skip_pq")
+        {
+            std::cout << "unsupported PQ mode. use reorder_pq/skip_pq " << std::endl;
+            return -4;
+        }
+    }
 
     int ret_val = -1;
     if (std::string(argv[1]) == std::string("float"))
-        ret_val = create_disk_layout<float>(argv, use_block_shuffling, max_iterations, gain_threshold);
+        ret_val =
+            create_disk_layout<float>(argv, use_block_shuffling, max_iterations, gain_threshold, reorder_pq_compressed);
     else if (std::string(argv[1]) == std::string("int8"))
-        ret_val = create_disk_layout<int8_t>(argv, use_block_shuffling, max_iterations, gain_threshold);
+        ret_val =
+            create_disk_layout<int8_t>(argv, use_block_shuffling, max_iterations, gain_threshold, reorder_pq_compressed);
     else if (std::string(argv[1]) == std::string("uint8"))
-        ret_val = create_disk_layout<uint8_t>(argv, use_block_shuffling, max_iterations, gain_threshold);
+        ret_val = create_disk_layout<uint8_t>(argv, use_block_shuffling, max_iterations, gain_threshold,
+                                              reorder_pq_compressed);
     else
     {
         std::cout << "unsupported type. use int8/uint8/float " << std::endl;

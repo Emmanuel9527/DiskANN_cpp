@@ -1286,10 +1286,73 @@ static std::vector<uint32_t> compute_block_shuffled_order(const std::vector<std:
     return new_to_old;
 }
 
+static std::string strip_suffix_if_present(const std::string &path, const std::string &suffix)
+{
+    if (path.size() >= suffix.size() && path.compare(path.size() - suffix.size(), suffix.size(), suffix) == 0)
+        return path.substr(0, path.size() - suffix.size());
+    return path;
+}
+
+static void reorder_pq_compressed_vectors(const std::string &input_file, const std::string &output_file,
+                                          const std::vector<uint32_t> &new_to_old)
+{
+    if (!file_exists(input_file))
+    {
+        diskann::cout << "Skipping PQ compressed vector reorder because input file does not exist: " << input_file
+                      << std::endl;
+        return;
+    }
+
+    std::ifstream reader(input_file, std::ios::binary);
+    reader.exceptions(std::ifstream::failbit | std::ifstream::badbit);
+    std::ofstream writer(output_file, std::ios::binary);
+    writer.exceptions(std::ofstream::failbit | std::ofstream::badbit);
+
+    uint32_t npts = 0, nchunks = 0;
+    reader.read((char *)&npts, sizeof(uint32_t));
+    reader.read((char *)&nchunks, sizeof(uint32_t));
+
+    if (npts != new_to_old.size())
+    {
+        std::stringstream stream;
+        stream << "PQ compressed vector count mismatch. input npts=" << npts
+               << ", mapping size=" << new_to_old.size() << std::endl;
+        throw diskann::ANNException(stream.str(), -1, __FUNCSIG__, __FILE__, __LINE__);
+    }
+
+    const size_t expected_file_size = 2 * sizeof(uint32_t) + (size_t)npts * (size_t)nchunks;
+    const size_t actual_file_size = get_file_size(input_file);
+    if (expected_file_size != actual_file_size)
+    {
+        std::stringstream stream;
+        stream << "PQ compressed file size mismatch. expected=" << expected_file_size
+               << ", actual=" << actual_file_size << std::endl;
+        throw diskann::ANNException(stream.str(), -1, __FUNCSIG__, __FILE__, __LINE__);
+    }
+
+    writer.write((char *)&npts, sizeof(uint32_t));
+    writer.write((char *)&nchunks, sizeof(uint32_t));
+
+    std::unique_ptr<uint8_t[]> code_buf = std::make_unique<uint8_t[]>(nchunks);
+    const uint64_t data_start = 2 * sizeof(uint32_t);
+    for (uint32_t new_id = 0; new_id < npts; new_id++)
+    {
+        const uint32_t old_id = new_to_old[new_id];
+        reader.seekg(data_start + (uint64_t)old_id * nchunks, std::ios::beg);
+        reader.read((char *)code_buf.get(), nchunks);
+        writer.write((char *)code_buf.get(), nchunks);
+    }
+
+    reader.close();
+    writer.close();
+    diskann::cout << "Reordered PQ compressed vectors written to " << output_file << std::endl;
+}
+
 template <typename T>
 void create_disk_layout_block_shuffling(const std::string base_file, const std::string mem_index_file,
                                         const std::string output_file, const std::string reorder_data_file,
-                                        const uint32_t max_iterations, const double gain_threshold)
+                                        const uint32_t max_iterations, const double gain_threshold,
+                                        const bool reorder_pq_compressed)
 {
     uint32_t npts, ndims;
     const size_t write_blk_size = 64 * 1024 * 1024;
@@ -1497,6 +1560,29 @@ void create_disk_layout_block_shuffling(const std::string base_file, const std::
     diskann::save_bin<uint64_t>(output_file, output_file_meta.data(), output_file_meta.size(), 1, 0);
     diskann::save_bin<uint32_t>(output_file + "_block_shuffle_old_to_new.bin", old_to_new.data(), old_to_new.size(), 1);
     diskann::save_bin<uint32_t>(output_file + "_block_shuffle_new_to_old.bin", new_to_old.data(), new_to_old.size(), 1);
+
+    if (reorder_pq_compressed)
+    {
+        const std::string input_index_prefix = strip_suffix_if_present(mem_index_file, "_mem.index");
+        const std::string output_index_prefix = strip_suffix_if_present(output_file, "_disk.index");
+        const std::string input_pq_compressed_file = input_index_prefix + "_pq_compressed.bin";
+        const std::string output_pq_compressed_file = output_index_prefix + "_pq_compressed.bin";
+        reorder_pq_compressed_vectors(input_pq_compressed_file, output_pq_compressed_file, new_to_old);
+
+        const std::string input_pq_pivots_file = input_index_prefix + "_pq_pivots.bin";
+        const std::string output_pq_pivots_file = output_index_prefix + "_pq_pivots.bin";
+        if (file_exists(input_pq_pivots_file))
+        {
+            copy_file(input_pq_pivots_file, output_pq_pivots_file);
+            diskann::cout << "Copied PQ pivots to " << output_pq_pivots_file << std::endl;
+        }
+    }
+    else
+    {
+        diskann::cout << "Skipping PQ compressed vector reorder. Pass reorder_pq to create matching PQ files."
+                      << std::endl;
+    }
+
     diskann::cout << "Block-shuffled disk index file written to " << output_file << std::endl;
 }
 
@@ -1803,19 +1889,22 @@ template DISKANN_DLLEXPORT void create_disk_layout_block_shuffling<int8_t>(const
                                                                            const std::string output_file,
                                                                            const std::string reorder_data_file,
                                                                            const uint32_t max_iterations,
-                                                                           const double gain_threshold);
+                                                                           const double gain_threshold,
+                                                                           const bool reorder_pq_compressed);
 template DISKANN_DLLEXPORT void create_disk_layout_block_shuffling<uint8_t>(const std::string base_file,
                                                                             const std::string mem_index_file,
                                                                             const std::string output_file,
                                                                             const std::string reorder_data_file,
                                                                             const uint32_t max_iterations,
-                                                                            const double gain_threshold);
+                                                                            const double gain_threshold,
+                                                                            const bool reorder_pq_compressed);
 template DISKANN_DLLEXPORT void create_disk_layout_block_shuffling<float>(const std::string base_file,
                                                                           const std::string mem_index_file,
                                                                           const std::string output_file,
                                                                           const std::string reorder_data_file,
                                                                           const uint32_t max_iterations,
-                                                                          const double gain_threshold);
+                                                                          const double gain_threshold,
+                                                                          const bool reorder_pq_compressed);
 
 template DISKANN_DLLEXPORT int8_t *load_warmup<int8_t>(const std::string &cache_warmup_file, uint64_t &warmup_num,
                                                        uint64_t warmup_dim, uint64_t warmup_aligned_dim);
