@@ -1504,7 +1504,7 @@ template <typename T, typename LabelT>
 int build_disk_index(const char *dataFilePath, const char *indexFilePath, const char *indexBuildParameters,
                      diskann::Metric compareMetric, bool use_opq, const std::string &codebook_prefix, bool use_filters,
                      const std::string &label_file, const std::string &universal_label, const uint32_t filter_threshold,
-                     const uint32_t Lf)
+                     const uint32_t Lf, const bool keep_vamana_graph)
 {
     std::stringstream parser;
     parser << std::string(indexBuildParameters);
@@ -1766,9 +1766,16 @@ int build_disk_index(const char *dataFilePath, const char *indexFilePath, const 
     }
     if (created_temp_file_for_processed_data)
         std::remove(prepped_base.c_str());
-    std::remove(mem_index_path.c_str());
-    std::remove((mem_index_path + ".data").c_str());
-    std::remove((mem_index_path + ".tags").c_str());
+    if (!keep_vamana_graph)
+    {
+        std::remove(mem_index_path.c_str());
+        std::remove((mem_index_path + ".data").c_str());
+        std::remove((mem_index_path + ".tags").c_str());
+    }
+    else
+    {
+        diskann::cout << "Keeping intermediate Vamana graph files with prefix: " << mem_index_path << std::endl;
+    }
     if (use_disk_pq)
         std::remove(disk_pq_compressed_vectors_path.c_str());
 
@@ -1855,21 +1862,24 @@ template DISKANN_DLLEXPORT int build_disk_index<int8_t, uint32_t>(const char *da
                                                                   const std::string &codebook_prefix, bool use_filters,
                                                                   const std::string &label_file,
                                                                   const std::string &universal_label,
-                                                                  const uint32_t filter_threshold, const uint32_t Lf);
+                                                                  const uint32_t filter_threshold, const uint32_t Lf,
+                                                                  const bool keep_vamana_graph);
 template DISKANN_DLLEXPORT int build_disk_index<uint8_t, uint32_t>(const char *dataFilePath, const char *indexFilePath,
                                                                    const char *indexBuildParameters,
                                                                    diskann::Metric compareMetric, bool use_opq,
                                                                    const std::string &codebook_prefix, bool use_filters,
                                                                    const std::string &label_file,
                                                                    const std::string &universal_label,
-                                                                   const uint32_t filter_threshold, const uint32_t Lf);
+                                                                   const uint32_t filter_threshold, const uint32_t Lf,
+                                                                   const bool keep_vamana_graph);
 template DISKANN_DLLEXPORT int build_disk_index<float, uint32_t>(const char *dataFilePath, const char *indexFilePath,
                                                                  const char *indexBuildParameters,
                                                                  diskann::Metric compareMetric, bool use_opq,
                                                                  const std::string &codebook_prefix, bool use_filters,
                                                                  const std::string &label_file,
                                                                  const std::string &universal_label,
-                                                                 const uint32_t filter_threshold, const uint32_t Lf);
+                                                                 const uint32_t filter_threshold, const uint32_t Lf,
+                                                                 const bool keep_vamana_graph);
 // LabelT = uint16
 template DISKANN_DLLEXPORT int build_disk_index<int8_t, uint16_t>(const char *dataFilePath, const char *indexFilePath,
                                                                   const char *indexBuildParameters,
@@ -1877,21 +1887,24 @@ template DISKANN_DLLEXPORT int build_disk_index<int8_t, uint16_t>(const char *da
                                                                   const std::string &codebook_prefix, bool use_filters,
                                                                   const std::string &label_file,
                                                                   const std::string &universal_label,
-                                                                  const uint32_t filter_threshold, const uint32_t Lf);
+                                                                  const uint32_t filter_threshold, const uint32_t Lf,
+                                                                  const bool keep_vamana_graph);
 template DISKANN_DLLEXPORT int build_disk_index<uint8_t, uint16_t>(const char *dataFilePath, const char *indexFilePath,
                                                                    const char *indexBuildParameters,
                                                                    diskann::Metric compareMetric, bool use_opq,
                                                                    const std::string &codebook_prefix, bool use_filters,
                                                                    const std::string &label_file,
                                                                    const std::string &universal_label,
-                                                                   const uint32_t filter_threshold, const uint32_t Lf);
+                                                                   const uint32_t filter_threshold, const uint32_t Lf,
+                                                                   const bool keep_vamana_graph);
 template DISKANN_DLLEXPORT int build_disk_index<float, uint16_t>(const char *dataFilePath, const char *indexFilePath,
                                                                  const char *indexBuildParameters,
                                                                  diskann::Metric compareMetric, bool use_opq,
                                                                  const std::string &codebook_prefix, bool use_filters,
                                                                  const std::string &label_file,
                                                                  const std::string &universal_label,
-                                                                 const uint32_t filter_threshold, const uint32_t Lf);
+                                                                 const uint32_t filter_threshold, const uint32_t Lf,
+                                                                 const bool keep_vamana_graph);
 
 template DISKANN_DLLEXPORT int build_merged_vamana_index<int8_t, uint32_t>(
     std::string base_file, diskann::Metric compareMetric, uint32_t L, uint32_t R, double sampling_rate,

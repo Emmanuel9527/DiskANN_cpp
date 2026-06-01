@@ -14,6 +14,8 @@
 #include "percentile_stats.h"
 #include "program_options_utils.hpp"
 
+#include <atomic>
+
 #ifndef _WINDOWS
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -53,7 +55,8 @@ int search_disk_index(diskann::Metric &metric, const std::string &index_path_pre
                       const uint32_t num_threads, const uint32_t recall_at, const uint32_t beamwidth,
                       const uint32_t num_nodes_to_cache, const uint32_t search_io_limit,
                       const std::vector<uint32_t> &Lvec, const float fail_if_recall_below,
-                      const std::vector<std::string> &query_filters, const bool use_reorder_data = false)
+                      const std::vector<std::string> &query_filters, const uint32_t progress_interval,
+                      const bool use_reorder_data = false)
 {
     diskann::cout << "Search parameters: #threads: " << num_threads << ", ";
     if (beamwidth <= 0)
@@ -223,6 +226,7 @@ int search_disk_index(diskann::Metric &metric, const std::string &index_path_pre
 
         std::vector<uint64_t> query_result_ids_64(recall_at * query_num);
         auto s = std::chrono::high_resolution_clock::now();
+        std::atomic<uint64_t> completed_queries(0);
 
 #pragma omp parallel for schedule(dynamic, 1)
         for (int64_t i = 0; i < (int64_t)query_num; i++)
@@ -249,6 +253,23 @@ int search_disk_index(diskann::Metric &metric, const std::string &index_path_pre
                     query + (i * query_aligned_dim), recall_at, L, query_result_ids_64.data() + (i * recall_at),
                     query_result_dists[test_id].data() + (i * recall_at), optimized_beamwidth, true, label_for_search,
                     use_reorder_data, stats + i);
+            }
+
+            if (progress_interval > 0)
+            {
+                const uint64_t done = ++completed_queries;
+                if (done % progress_interval == 0 || done == query_num)
+                {
+#pragma omp critical(search_progress_print)
+                    {
+                        const auto now = std::chrono::high_resolution_clock::now();
+                        const std::chrono::duration<double> elapsed = now - s;
+                        const double qps_so_far = elapsed.count() > 0 ? (double)done / elapsed.count() : 0.0;
+                        diskann::cout << "[progress] L=" << L << " completed " << done << "/" << query_num
+                                      << " queries, elapsed=" << elapsed.count() << "s"
+                                      << ", qps_so_far=" << qps_so_far << std::endl;
+                    }
+                }
             }
         }
         auto e = std::chrono::high_resolution_clock::now();
@@ -317,7 +338,7 @@ int main(int argc, char **argv)
 {
     std::string data_type, dist_fn, index_path_prefix, result_path_prefix, query_file, gt_file, filter_label,
         label_type, query_filters_file;
-    uint32_t num_threads, K, W, num_nodes_to_cache, search_io_limit;
+    uint32_t num_threads, K, W, num_nodes_to_cache, search_io_limit, progress_interval;
     std::vector<uint32_t> Lvec;
     bool use_reorder_data = false;
     float fail_if_recall_below = 0.0f;
@@ -375,6 +396,10 @@ int main(int argc, char **argv)
         optional_configs.add_options()("fail_if_recall_below",
                                        po::value<float>(&fail_if_recall_below)->default_value(0.0f),
                                        program_options_utils::FAIL_IF_RECALL_BELOW);
+        optional_configs.add_options()("progress_interval",
+                                       po::value<uint32_t>(&progress_interval)->default_value(0),
+                                       "Print search progress after this many completed queries for each L. "
+                                       "Set to 0 to disable progress logging.");
 
         // Merge required and optional parameters
         desc.add(required_configs).add(optional_configs);
@@ -454,15 +479,18 @@ int main(int argc, char **argv)
             if (data_type == std::string("float"))
                 return search_disk_index<float, uint16_t>(
                     metric, index_path_prefix, result_path_prefix, query_file, gt_file, num_threads, K, W,
-                    num_nodes_to_cache, search_io_limit, Lvec, fail_if_recall_below, query_filters, use_reorder_data);
+                    num_nodes_to_cache, search_io_limit, Lvec, fail_if_recall_below, query_filters, progress_interval,
+                    use_reorder_data);
             else if (data_type == std::string("int8"))
                 return search_disk_index<int8_t, uint16_t>(
                     metric, index_path_prefix, result_path_prefix, query_file, gt_file, num_threads, K, W,
-                    num_nodes_to_cache, search_io_limit, Lvec, fail_if_recall_below, query_filters, use_reorder_data);
+                    num_nodes_to_cache, search_io_limit, Lvec, fail_if_recall_below, query_filters, progress_interval,
+                    use_reorder_data);
             else if (data_type == std::string("uint8"))
                 return search_disk_index<uint8_t, uint16_t>(
                     metric, index_path_prefix, result_path_prefix, query_file, gt_file, num_threads, K, W,
-                    num_nodes_to_cache, search_io_limit, Lvec, fail_if_recall_below, query_filters, use_reorder_data);
+                    num_nodes_to_cache, search_io_limit, Lvec, fail_if_recall_below, query_filters, progress_interval,
+                    use_reorder_data);
             else
             {
                 std::cerr << "Unsupported data type. Use float or int8 or uint8" << std::endl;
@@ -474,15 +502,18 @@ int main(int argc, char **argv)
             if (data_type == std::string("float"))
                 return search_disk_index<float>(metric, index_path_prefix, result_path_prefix, query_file, gt_file,
                                                 num_threads, K, W, num_nodes_to_cache, search_io_limit, Lvec,
-                                                fail_if_recall_below, query_filters, use_reorder_data);
+                                                fail_if_recall_below, query_filters, progress_interval,
+                                                use_reorder_data);
             else if (data_type == std::string("int8"))
                 return search_disk_index<int8_t>(metric, index_path_prefix, result_path_prefix, query_file, gt_file,
                                                  num_threads, K, W, num_nodes_to_cache, search_io_limit, Lvec,
-                                                 fail_if_recall_below, query_filters, use_reorder_data);
+                                                 fail_if_recall_below, query_filters, progress_interval,
+                                                 use_reorder_data);
             else if (data_type == std::string("uint8"))
                 return search_disk_index<uint8_t>(metric, index_path_prefix, result_path_prefix, query_file, gt_file,
                                                   num_threads, K, W, num_nodes_to_cache, search_io_limit, Lvec,
-                                                  fail_if_recall_below, query_filters, use_reorder_data);
+                                                  fail_if_recall_below, query_filters, progress_interval,
+                                                  use_reorder_data);
             else
             {
                 std::cerr << "Unsupported data type. Use float or int8 or uint8" << std::endl;

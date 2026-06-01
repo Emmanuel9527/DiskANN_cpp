@@ -358,6 +358,7 @@ cscope*
 
 build/
 build_linux/
+build_clean/
 !.github/actions/build
 
 # jetbrains specific stuff
@@ -376,3 +377,31 @@ venv*/**
 
 gperftools
 
+# DiskANN local datasets and experiment outputs
+data/
+datasets/
+experiments/
+results/
+index_baseline/
+index_block_shuffle/
+*_disk.index
+*_mem.index
+*_mem.index.data
+*_mem.index.tags
+*_pq_compressed.bin
+*_pq_pivots.bin
+*_sample_data.bin
+*_sample_ids.bin
+*_old_to_new.bin
+*_new_to_old.bin
+*_idx_uint32.bin
+*_dists_float.bin
+*.fvecs
+*.ivecs
+*.bvecs
+*.fbin
+*.ibin
+*.u8bin
+*.tar
+*.tar.gz
+*.tgz
