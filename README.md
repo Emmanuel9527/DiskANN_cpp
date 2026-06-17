@@ -111,3 +111,97 @@ Please cite this software in your work as:
    year = {2023}
 }
 ```
+
+## Block-Shuffled Disk Layout Extensions
+
+This fork adds an experimental disk-layout path for studying whether graph-local
+points can be packed into the same disk sector and then exploited during
+disk-based beam search.
+
+### What changed compared with upstream DiskANN
+
+- `apps/utils/create_disk_layout` accepts a `block_shuffle` layout mode.
+- `src/disk_utils.cpp` contains block-shuffling logic that groups graph-near
+  nodes into the same fixed-size disk block when multiple nodes fit in one
+  4KB sector.
+- Block-shuffled layout generation renumbers nodes and rewrites graph neighbor
+  ids from old ids to new ids.
+- The layout writer emits:
+  - `<disk_index>_block_shuffle_old_to_new.bin`
+  - `<disk_index>_block_shuffle_new_to_old.bin`
+- `apps/search_disk_index` accepts `--result_new_to_old_map` so recall can be
+  computed against ground truth in the original id space.
+- `apps/search_disk_index` accepts `--use_sector_candidates` to enable a new
+  sector-aware search mode. In this mode, when beam search reads the sector for
+  a frontier node, it also expands the other valid nodes already present in the
+  same sector. This is intended to turn block-shuffled physical locality into
+  useful search-time candidates.
+
+By default, `search_disk_index` keeps the upstream node-centric behavior. The
+new sector-aware behavior is enabled only when `--use_sector_candidates` is
+provided.
+
+### Build a block-shuffled disk layout
+
+After building an in-memory Vamana index and the usual PQ files, create a
+block-shuffled disk index with:
+
+```bash
+build/apps/utils/create_disk_layout <data_type> <base_file> <mem_index_file> <output_disk_index> block_shuffle <max_iterations> <gain_threshold> reorder_pq
+```
+
+Example:
+
+```bash
+build/apps/utils/create_disk_layout float data/sift/sift_learn.fbin data/sift/index_mem.index data/sift/index_disk.index block_shuffle 5 0.0001 reorder_pq
+```
+
+Use `reorder_pq` when the disk layout renumbers nodes. This rewrites
+`<prefix>_pq_compressed.bin` so PQ distances are still looked up with the new
+node ids used by the block-shuffled disk graph.
+
+### Search baseline versus sector-aware mode
+
+Baseline search keeps the original node-centric expansion:
+
+```bash
+build/apps/search_disk_index \
+  --data_type float \
+  --dist_fn l2 \
+  --index_path_prefix data/sift/index \
+  --result_path data/sift/res_baseline \
+  --query_file data/sift/sift_query.fbin \
+  --gt_file data/sift/sift_groundtruth.bin \
+  -K 10 \
+  -L 50 100 \
+  -W 4 \
+  --result_new_to_old_map data/sift/index_disk.index_block_shuffle_new_to_old.bin
+```
+
+Sector-aware search uses the same index and parameters, but adds:
+
+```bash
+  --use_sector_candidates
+```
+
+Full example:
+
+```bash
+build/apps/search_disk_index \
+  --data_type float \
+  --dist_fn l2 \
+  --index_path_prefix data/sift/index \
+  --result_path data/sift/res_sector_candidates \
+  --query_file data/sift/sift_query.fbin \
+  --gt_file data/sift/sift_groundtruth.bin \
+  -K 10 \
+  -L 50 100 \
+  -W 4 \
+  --result_new_to_old_map data/sift/index_disk.index_block_shuffle_new_to_old.bin \
+  --use_sector_candidates
+```
+
+Use the same `-K`, `-L`, `-W`, thread count, cache size, and query set when
+comparing the two modes. The useful comparison is baseline block-shuffled search
+without `--use_sector_candidates` versus block-shuffled search with
+`--use_sector_candidates`.

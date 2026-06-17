@@ -1237,31 +1237,33 @@ bool getNextCompletedRequest(std::shared_ptr<AlignedFileReader> &reader, IOConte
 template <typename T, typename LabelT>
 void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t k_search, const uint64_t l_search,
                                                  uint64_t *indices, float *distances, const uint64_t beam_width,
-                                                 const bool use_reorder_data, QueryStats *stats)
+                                                 const bool use_reorder_data, QueryStats *stats,
+                                                 const bool use_sector_candidates)
 {
     cached_beam_search(query1, k_search, l_search, indices, distances, beam_width, std::numeric_limits<uint32_t>::max(),
-                       use_reorder_data, stats);
+                       use_reorder_data, stats, use_sector_candidates);
 }
 
 template <typename T, typename LabelT>
 void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t k_search, const uint64_t l_search,
                                                  uint64_t *indices, float *distances, const uint64_t beam_width,
                                                  const bool use_filter, const LabelT &filter_label,
-                                                 const bool use_reorder_data, QueryStats *stats)
+                                                 const bool use_reorder_data, QueryStats *stats,
+                                                 const bool use_sector_candidates)
 {
     cached_beam_search(query1, k_search, l_search, indices, distances, beam_width, use_filter, filter_label,
-                       std::numeric_limits<uint32_t>::max(), use_reorder_data, stats);
+                       std::numeric_limits<uint32_t>::max(), use_reorder_data, stats, use_sector_candidates);
 }
 
 template <typename T, typename LabelT>
 void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t k_search, const uint64_t l_search,
                                                  uint64_t *indices, float *distances, const uint64_t beam_width,
                                                  const uint32_t io_limit, const bool use_reorder_data,
-                                                 QueryStats *stats)
+                                                 QueryStats *stats, const bool use_sector_candidates)
 {
     LabelT dummy_filter = 0;
     cached_beam_search(query1, k_search, l_search, indices, distances, beam_width, false, dummy_filter, io_limit,
-                       use_reorder_data, stats);
+                       use_reorder_data, stats, use_sector_candidates);
 }
 
 template <typename T, typename LabelT>
@@ -1269,7 +1271,7 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
                                                  uint64_t *indices, float *distances, const uint64_t beam_width,
                                                  const bool use_filter, const LabelT &filter_label,
                                                  const uint32_t io_limit, const bool use_reorder_data,
-                                                 QueryStats *stats)
+                                                 QueryStats *stats, const bool use_sector_candidates)
 {
 
     uint64_t num_sector_per_nodes = DIV_ROUND_UP(_max_node_len, defaults::SECTOR_LEN);
@@ -1399,6 +1401,7 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
     compute_dists(&best_medoid, 1, dist_scratch);
     retset.insert(Neighbor(best_medoid, dist_scratch[0]));
     visited.insert(best_medoid);
+    tsl::robin_set<uint32_t> expanded_nodes;
 
     uint32_t cmps = 0;
     uint32_t hops = 0;
@@ -1413,6 +1416,7 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
     frontier_read_reqs.reserve(2 * beam_width);
     std::vector<std::pair<uint32_t, std::pair<uint32_t, uint32_t *>>> cached_nhoods;
     cached_nhoods.reserve(2 * beam_width);
+    tsl::robin_set<uint64_t> frontier_sectors;
 
     while (retset.has_unexpanded_node() && num_ios < io_limit)
     {
@@ -1421,6 +1425,7 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
         frontier_nhoods.clear();
         frontier_read_reqs.clear();
         cached_nhoods.clear();
+        frontier_sectors.clear();
         sector_scratch_idx = 0;
         // find new beam
         uint32_t num_seen = 0;
@@ -1428,6 +1433,10 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
         {
             auto nbr = retset.closest_unexpanded();
             num_seen++;
+            if (use_sector_candidates && expanded_nodes.find(nbr.id) != expanded_nodes.end())
+            {
+                continue;
+            }
             auto iter = _nhood_cache.find(nbr.id);
             if (iter != _nhood_cache.end())
             {
@@ -1439,6 +1448,14 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
             }
             else
             {
+                if (use_sector_candidates && _nnodes_per_sector > 0)
+                {
+                    const uint64_t sector = get_node_sector(nbr.id);
+                    if (!frontier_sectors.insert(sector).second)
+                    {
+                        continue;
+                    }
+                }
                 frontier.push_back(nbr.id);
             }
             if (this->_count_visited_nodes)
@@ -1485,6 +1502,7 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
         // process cached nhoods
         for (auto &cached_nhood : cached_nhoods)
         {
+            expanded_nodes.insert(cached_nhood.first);
             auto global_cache_iter = _coord_cache.find(cached_nhood.first);
             T *node_fp_coords_copy = global_cache_iter->second;
             float cur_expanded_dist;
@@ -1548,6 +1566,85 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
         for (auto &frontier_nhood : frontier_nhoods)
         {
 #endif
+            auto process_sector_node = [&](uint32_t expanded_id, char *node_disk_buf) {
+                if (expanded_id >= this->_num_points)
+                {
+                    return;
+                }
+                if (expanded_nodes.find(expanded_id) != expanded_nodes.end())
+                {
+                    return;
+                }
+                if (!use_filter && _dummy_pts.find(expanded_id) != _dummy_pts.end())
+                {
+                    return;
+                }
+                if (use_filter && !(point_has_label(expanded_id, filter_label)) &&
+                    (!_use_universal_label || !point_has_label(expanded_id, _universal_filter_label)))
+                {
+                    return;
+                }
+
+                expanded_nodes.insert(expanded_id);
+                visited.insert(expanded_id);
+
+                uint32_t *node_buf = offset_to_node_nhood(node_disk_buf);
+                uint64_t nnbrs = (uint64_t)(*node_buf);
+                T *node_fp_coords = offset_to_node_coords(node_disk_buf);
+                memcpy(data_buf, node_fp_coords, _disk_bytes_per_point);
+                float cur_expanded_dist;
+                if (!_use_disk_index_pq)
+                {
+                    cur_expanded_dist = _dist_cmp->compare(aligned_query_T, data_buf, (uint32_t)_aligned_dim);
+                }
+                else
+                {
+                    if (metric == diskann::Metric::INNER_PRODUCT)
+                        cur_expanded_dist = _disk_pq_table.inner_product(query_float, (uint8_t *)data_buf);
+                    else
+                        cur_expanded_dist = _disk_pq_table.l2_distance(query_float, (uint8_t *)data_buf);
+                }
+                full_retset.push_back(Neighbor(expanded_id, cur_expanded_dist));
+                uint32_t *node_nbrs = (node_buf + 1);
+
+                cpu_timer.reset();
+                compute_dists(node_nbrs, nnbrs, dist_scratch);
+                if (stats != nullptr)
+                {
+                    stats->n_cmps += (uint32_t)nnbrs;
+                    stats->cpu_us += (float)cpu_timer.elapsed();
+                }
+
+                cpu_timer.reset();
+                for (uint64_t m = 0; m < nnbrs; ++m)
+                {
+                    uint32_t id = node_nbrs[m];
+                    if (visited.insert(id).second)
+                    {
+                        if (!use_filter && _dummy_pts.find(id) != _dummy_pts.end())
+                            continue;
+
+                        if (use_filter && !(point_has_label(id, filter_label)) &&
+                            (!_use_universal_label || !point_has_label(id, _universal_filter_label)))
+                            continue;
+                        cmps++;
+                        float dist = dist_scratch[m];
+                        if (stats != nullptr)
+                        {
+                            stats->n_cmps++;
+                        }
+
+                        Neighbor nn(id, dist);
+                        retset.insert(nn);
+                    }
+                }
+
+                if (stats != nullptr)
+                {
+                    stats->cpu_us += (float)cpu_timer.elapsed();
+                }
+            };
+
             char *node_disk_buf = offset_to_node(frontier_nhood.second, frontier_nhood.first);
             uint32_t *node_buf = offset_to_node_nhood(node_disk_buf);
             uint64_t nnbrs = (uint64_t)(*node_buf);
@@ -1604,6 +1701,24 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
             if (stats != nullptr)
             {
                 stats->cpu_us += (float)cpu_timer.elapsed();
+            }
+
+            expanded_nodes.insert(frontier_nhood.first);
+
+            if (use_sector_candidates && _nnodes_per_sector > 0)
+            {
+                const uint32_t first_id_in_sector =
+                    (uint32_t)(((uint64_t)frontier_nhood.first / _nnodes_per_sector) * _nnodes_per_sector);
+                const uint32_t end_id_in_sector =
+                    (uint32_t)(std::min)(this->_num_points, (uint64_t)first_id_in_sector + _nnodes_per_sector);
+                for (uint32_t sector_id = first_id_in_sector; sector_id < end_id_in_sector; sector_id++)
+                {
+                    if (sector_id == frontier_nhood.first)
+                    {
+                        continue;
+                    }
+                    process_sector_node(sector_id, offset_to_node(frontier_nhood.second, sector_id));
+                }
             }
         }
 
