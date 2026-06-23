@@ -378,6 +378,7 @@ venv*/**
 gperftools
 
 # DiskANN local datasets and experiment outputs
+/document/
 data/
 datasets/
 experiments/

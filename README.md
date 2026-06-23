@@ -114,6 +114,9 @@ Please cite this software in your work as:
 
 ## Block-Shuffled Disk Layout Extensions
 
+For the complete build and three-way experiment commands, see
+[Block-Shuffled Disk Layout Experiment](workflows/block_shuffled_disk_layout.md).
+
 This fork adds an experimental disk-layout path for studying whether graph-local
 points can be packed into the same disk sector and then exploited during
 disk-based beam search.
@@ -205,3 +208,160 @@ Use the same `-K`, `-L`, `-W`, thread count, cache size, and query set when
 comparing the two modes. The useful comparison is baseline block-shuffled search
 without `--use_sector_candidates` versus block-shuffled search with
 `--use_sector_candidates`.
+
+### WSL-native test recipe
+
+Do not run the benchmark directly from `/mnt/c/...` or `/mnt/d/...` if you care
+about disk I/O numbers. Copy the repo and data into the Linux filesystem first,
+for example under `~`.
+
+From WSL, copy the repo into `~/DiskANN` and work from there:
+
+```bash
+cd ~
+rsync -a --exclude build --exclude build_clean /mnt/d/Papers/Diskann/DiskANN_cpp/ ~/DiskANN/
+cd ~/DiskANN
+
+mkdir -p build
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build --target search_disk_index create_disk_layout -j
+```
+
+Put your dataset files under the WSL-native workspace as well:
+
+```bash
+cd ~/DiskANN
+mkdir -p data
+
+# Example only. Replace these paths with your real local dataset paths.
+cp /mnt/d/path/to/base.fbin data/base.fbin
+cp /mnt/d/path/to/query.fbin data/query.fbin
+cp /mnt/d/path/to/gt.bin data/gt.bin
+```
+
+Also copy the already-built memory index and PQ files into WSL. The examples
+below assume they are renamed to the `PREFIX_DEFAULT` prefix:
+
+```bash
+cd ~/DiskANN
+mkdir -p index
+
+# Example only. Replace /mnt/d/path/to/original_index with your real prefix.
+# These source files are:
+#   original_index_mem.index
+#   original_index_pq_pivots.bin
+#   original_index_pq_compressed.bin
+cp /mnt/d/path/to/original_index_mem.index index/default_mem.index
+cp /mnt/d/path/to/original_index_pq_pivots.bin index/default_pq_pivots.bin
+cp /mnt/d/path/to/original_index_pq_compressed.bin index/default_pq_compressed.bin
+```
+
+The commands below assume these variables. Adjust `DATA_TYPE`, `DIST_FN`,
+`K`, `L_VALUES`, `W`, and `T` for your experiment:
+
+```bash
+cd ~/DiskANN
+
+DATA_TYPE=float
+DIST_FN=l2
+BASE=~/DiskANN/data/base.fbin
+QUERY=~/DiskANN/data/query.fbin
+GT=~/DiskANN/data/gt.bin
+PREFIX_DEFAULT=~/DiskANN/index/default
+PREFIX_BLOCK=~/DiskANN/index/block
+K=10
+L_VALUES="20 30 40 50 60 100"
+W=4
+T=8
+
+mkdir -p ~/DiskANN/index ~/DiskANN/results
+```
+
+Create a normal disk layout from an existing memory index:
+
+```bash
+build/apps/utils/create_disk_layout \
+  ${DATA_TYPE} \
+  ${BASE} \
+  ${PREFIX_DEFAULT}_mem.index \
+  ${PREFIX_DEFAULT}_disk.index \
+  default
+```
+
+Create a block-shuffled disk layout from the same memory index. Use
+`reorder_pq` so the in-memory PQ codes are renumbered consistently with the
+block-shuffled graph ids:
+
+```bash
+build/apps/utils/create_disk_layout \
+  ${DATA_TYPE} \
+  ${BASE} \
+  ${PREFIX_DEFAULT}_mem.index \
+  ${PREFIX_BLOCK}_disk.index \
+  block_shuffle \
+  5 \
+  0.0001 \
+  reorder_pq
+```
+
+Run the normal layout baseline:
+
+```bash
+build/apps/search_disk_index \
+  --data_type ${DATA_TYPE} \
+  --dist_fn ${DIST_FN} \
+  --index_path_prefix ${PREFIX_DEFAULT} \
+  --result_path ~/DiskANN/results/default_baseline \
+  --query_file ${QUERY} \
+  --gt_file ${GT} \
+  -K ${K} \
+  -L ${L_VALUES} \
+  -W ${W} \
+  -T ${T} \
+  --num_nodes_to_cache 0 \
+  | tee ~/DiskANN/results/default_baseline.log
+```
+
+Run the block-shuffled layout with the original node-centric search. This
+isolates the effect of renumbering the layout without using sector candidates:
+
+```bash
+build/apps/search_disk_index \
+  --data_type ${DATA_TYPE} \
+  --dist_fn ${DIST_FN} \
+  --index_path_prefix ${PREFIX_BLOCK} \
+  --result_path ~/DiskANN/results/block_baseline \
+  --query_file ${QUERY} \
+  --gt_file ${GT} \
+  -K ${K} \
+  -L ${L_VALUES} \
+  -W ${W} \
+  -T ${T} \
+  --num_nodes_to_cache 0 \
+  --result_new_to_old_map ${PREFIX_BLOCK}_disk.index_block_shuffle_new_to_old.bin \
+  | tee ~/DiskANN/results/block_baseline.log
+```
+
+Run the block-shuffled layout with sector-aware expansion enabled:
+
+```bash
+build/apps/search_disk_index \
+  --data_type ${DATA_TYPE} \
+  --dist_fn ${DIST_FN} \
+  --index_path_prefix ${PREFIX_BLOCK} \
+  --result_path ~/DiskANN/results/block_sector_candidates \
+  --query_file ${QUERY} \
+  --gt_file ${GT} \
+  -K ${K} \
+  -L ${L_VALUES} \
+  -W ${W} \
+  -T ${T} \
+  --num_nodes_to_cache 0 \
+  --result_new_to_old_map ${PREFIX_BLOCK}_disk.index_block_shuffle_new_to_old.bin \
+  --use_sector_candidates \
+  | tee ~/DiskANN/results/block_sector_candidates.log
+```
+
+For the cleanest comparison, keep `--num_nodes_to_cache 0` at first. A large
+node cache can hide disk-layout effects because many early expansions come from
+memory instead of sector reads.
