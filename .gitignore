@@ -383,6 +383,7 @@ data/
 datasets/
 experiments/
 results/
+index/
 index_baseline/
 index_block_shuffle/
 *_disk.index

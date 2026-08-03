@@ -233,6 +233,51 @@ build/apps/search_disk_index \
 | `reorder_pq` | layout | Reorders in-memory PQ codes to match the new IDs. |
 | `--result_new_to_old_map` | search | Converts returned IDs back to original IDs for output and recall. |
 | `--use_sector_candidates` | search | Expands other valid nodes obtained from the same sector read. |
+| `--trace_stats_csv` | search | Enables opt-in per-query, per-iteration locality tracing and writes raw rows to CSV. |
+| `--trace_sample_rate` | search | Traces every Nth query when `--trace_stats_csv` is set. |
+| `--trace_max_queries` | search | Caps the number of sampled queries traced per search run. |
+| `--trace_run_label` | search | Adds a run label to every trace CSV row for later grouping. |
+
+## Reproducing the four locality observations
+
+The trace mode is disabled unless `--trace_stats_csv` is provided. When enabled,
+the search path records one aggregate row per sampled query iteration without
+storing node-id lists. Each row includes lifecycle bin, iteration time, IO wait,
+cache hits, uncached nodes, issued reads, unique sectors, useful payload bytes,
+and neighbor-utilization counters.
+
+The helper below runs the default layout, block-shuffled layout, and
+block-shuffled layout with sector candidates across cache sizes:
+
+```bash
+BASE=/path/to/sift1b/base.fbin \
+QUERY=/path/to/sift1b/query.fbin \
+GT=/path/to/sift1b/gt.bin \
+BUILD_DIR=build \
+CACHE_SIZES="1000 5000 10000 25000 50000" \
+TRACE_SAMPLE_RATE=10 \
+TRACE_MAX_QUERIES=1000 \
+scripts/locality/run_block_shuffle_cache_locality.sh
+```
+
+The raw trace is written to:
+
+```text
+results/cache_locality/iteration_trace.csv
+```
+
+The summarizer produces four CSV files corresponding to the meeting slides:
+
+```text
+results/cache_locality/summaries/experiment1_iteration_io_by_lifecycle.csv
+results/cache_locality/summaries/experiment2_overfetch_by_lifecycle.csv
+results/cache_locality/summaries/experiment3_uncached_reads_by_lifecycle.csv
+results/cache_locality/summaries/experiment4_neighbor_utilization_by_lifecycle.csv
+```
+
+These summaries group by run label, `L`, beamwidth, cache size, sector-candidate
+mode, and normalized lifecycle bin. Use the raw CSV if you want to plot the same
+metrics with a different aggregation.
 
 ## Fair-comparison checklist
 

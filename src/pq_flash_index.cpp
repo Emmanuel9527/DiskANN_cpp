@@ -1238,10 +1238,10 @@ template <typename T, typename LabelT>
 void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t k_search, const uint64_t l_search,
                                                  uint64_t *indices, float *distances, const uint64_t beam_width,
                                                  const bool use_reorder_data, QueryStats *stats,
-                                                 const bool use_sector_candidates)
+                                                 const bool use_sector_candidates, QueryTrace *trace)
 {
     cached_beam_search(query1, k_search, l_search, indices, distances, beam_width, std::numeric_limits<uint32_t>::max(),
-                       use_reorder_data, stats, use_sector_candidates);
+                       use_reorder_data, stats, use_sector_candidates, trace);
 }
 
 template <typename T, typename LabelT>
@@ -1249,21 +1249,21 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
                                                  uint64_t *indices, float *distances, const uint64_t beam_width,
                                                  const bool use_filter, const LabelT &filter_label,
                                                  const bool use_reorder_data, QueryStats *stats,
-                                                 const bool use_sector_candidates)
+                                                 const bool use_sector_candidates, QueryTrace *trace)
 {
     cached_beam_search(query1, k_search, l_search, indices, distances, beam_width, use_filter, filter_label,
-                       std::numeric_limits<uint32_t>::max(), use_reorder_data, stats, use_sector_candidates);
+                       std::numeric_limits<uint32_t>::max(), use_reorder_data, stats, use_sector_candidates, trace);
 }
 
 template <typename T, typename LabelT>
 void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t k_search, const uint64_t l_search,
                                                  uint64_t *indices, float *distances, const uint64_t beam_width,
                                                  const uint32_t io_limit, const bool use_reorder_data,
-                                                 QueryStats *stats, const bool use_sector_candidates)
+                                                 QueryStats *stats, const bool use_sector_candidates, QueryTrace *trace)
 {
     LabelT dummy_filter = 0;
     cached_beam_search(query1, k_search, l_search, indices, distances, beam_width, false, dummy_filter, io_limit,
-                       use_reorder_data, stats, use_sector_candidates);
+                       use_reorder_data, stats, use_sector_candidates, trace);
 }
 
 template <typename T, typename LabelT>
@@ -1271,7 +1271,7 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
                                                  uint64_t *indices, float *distances, const uint64_t beam_width,
                                                  const bool use_filter, const LabelT &filter_label,
                                                  const uint32_t io_limit, const bool use_reorder_data,
-                                                 QueryStats *stats, const bool use_sector_candidates)
+                                                 QueryStats *stats, const bool use_sector_candidates, QueryTrace *trace)
 {
 
     uint64_t num_sector_per_nodes = DIV_ROUND_UP(_max_node_len, defaults::SECTOR_LEN);
@@ -1417,15 +1417,27 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
     std::vector<std::pair<uint32_t, std::pair<uint32_t, uint32_t *>>> cached_nhoods;
     cached_nhoods.reserve(2 * beam_width);
     tsl::robin_set<uint64_t> frontier_sectors;
+    tsl::robin_set<uint64_t> trace_read_sectors;
+    tsl::robin_set<uint32_t> trace_unique_neighbors;
 
     while (retset.has_unexpanded_node() && num_ios < io_limit)
     {
+        Timer iteration_timer;
+        diskann::QueryIterationTrace iteration_trace;
+        const bool collect_trace = trace != nullptr;
+
         // clear iteration state
         frontier.clear();
         frontier_nhoods.clear();
         frontier_read_reqs.clear();
         cached_nhoods.clear();
         frontier_sectors.clear();
+        if (collect_trace)
+        {
+            trace_read_sectors.clear();
+            trace_unique_neighbors.clear();
+            iteration_trace.iteration = hops;
+        }
         sector_scratch_idx = 0;
         // find new beam
         uint32_t num_seen = 0;
@@ -1441,6 +1453,10 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
             if (iter != _nhood_cache.end())
             {
                 cached_nhoods.push_back(std::make_pair(nbr.id, iter->second));
+                if (collect_trace)
+                {
+                    iteration_trace.cache_hits++;
+                }
                 if (stats != nullptr)
                 {
                     stats->n_cache_hits++;
@@ -1448,13 +1464,17 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
             }
             else
             {
+                const uint64_t sector = get_node_sector(nbr.id);
                 if (use_sector_candidates && _nnodes_per_sector > 0)
                 {
-                    const uint64_t sector = get_node_sector(nbr.id);
                     if (!frontier_sectors.insert(sector).second)
                     {
                         continue;
                     }
+                }
+                if (collect_trace)
+                {
+                    trace_read_sectors.insert(sector);
                 }
                 frontier.push_back(nbr.id);
             }
@@ -1465,6 +1485,16 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
         }
 
         // read nhoods of frontier ids
+        if (collect_trace)
+        {
+            iteration_trace.uncached_nodes = (uint32_t)frontier.size();
+            iteration_trace.issued_reads = (uint32_t)frontier.size();
+            iteration_trace.unique_sectors = (uint32_t)trace_read_sectors.size();
+            iteration_trace.duplicate_sectors =
+                iteration_trace.issued_reads > iteration_trace.unique_sectors
+                    ? iteration_trace.issued_reads - iteration_trace.unique_sectors
+                    : 0;
+        }
         if (!frontier.empty())
         {
             if (stats != nullptr)
@@ -1479,6 +1509,10 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
                 frontier_nhoods.push_back(fnhood);
                 frontier_read_reqs.emplace_back(get_node_sector((size_t)id) * defaults::SECTOR_LEN,
                                                 num_sectors_per_node * defaults::SECTOR_LEN, fnhood.second);
+                if (collect_trace)
+                {
+                    iteration_trace.requested_bytes += num_sectors_per_node * defaults::SECTOR_LEN;
+                }
                 if (stats != nullptr)
                 {
                     stats->n_4k++;
@@ -1493,9 +1527,14 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
 #else
             reader->read(frontier_read_reqs, ctx); // synchronous IO linux
 #endif
+            const float elapsed_io_us = (float)io_timer.elapsed();
             if (stats != nullptr)
             {
-                stats->io_us += (float)io_timer.elapsed();
+                stats->io_us += elapsed_io_us;
+            }
+            if (collect_trace)
+            {
+                iteration_trace.io_us += elapsed_io_us;
             }
         }
 
@@ -1522,6 +1561,14 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
 
             uint64_t nnbrs = cached_nhood.second.first;
             uint32_t *node_nbrs = cached_nhood.second.second;
+            if (collect_trace)
+            {
+                iteration_trace.neighbors_seen += (uint32_t)nnbrs;
+                for (uint64_t m = 0; m < nnbrs; ++m)
+                {
+                    trace_unique_neighbors.insert(node_nbrs[m]);
+                }
+            }
 
             // compute node_nbrs <-> query dists in PQ space
             cpu_timer.reset();
@@ -1538,6 +1585,10 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
                 uint32_t id = node_nbrs[m];
                 if (visited.insert(id).second)
                 {
+                    if (collect_trace)
+                    {
+                        iteration_trace.new_visited++;
+                    }
                     if (!use_filter && _dummy_pts.find(id) != _dummy_pts.end())
                         continue;
 
@@ -1548,6 +1599,10 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
                     float dist = dist_scratch[m];
                     Neighbor nn(id, dist);
                     retset.insert(nn);
+                    if (collect_trace)
+                    {
+                        iteration_trace.candidates_inserted++;
+                    }
                 }
             }
         }
@@ -1590,6 +1645,12 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
 
                 uint32_t *node_buf = offset_to_node_nhood(node_disk_buf);
                 uint64_t nnbrs = (uint64_t)(*node_buf);
+                if (collect_trace)
+                {
+                    iteration_trace.useful_payload_bytes +=
+                        _disk_bytes_per_point + sizeof(uint32_t) * (1 + nnbrs);
+                    iteration_trace.neighbors_seen += (uint32_t)nnbrs;
+                }
                 T *node_fp_coords = offset_to_node_coords(node_disk_buf);
                 memcpy(data_buf, node_fp_coords, _disk_bytes_per_point);
                 float cur_expanded_dist;
@@ -1619,8 +1680,16 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
                 for (uint64_t m = 0; m < nnbrs; ++m)
                 {
                     uint32_t id = node_nbrs[m];
+                    if (collect_trace)
+                    {
+                        trace_unique_neighbors.insert(id);
+                    }
                     if (visited.insert(id).second)
                     {
+                        if (collect_trace)
+                        {
+                            iteration_trace.new_visited++;
+                        }
                         if (!use_filter && _dummy_pts.find(id) != _dummy_pts.end())
                             continue;
 
@@ -1636,6 +1705,10 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
 
                         Neighbor nn(id, dist);
                         retset.insert(nn);
+                        if (collect_trace)
+                        {
+                            iteration_trace.candidates_inserted++;
+                        }
                     }
                 }
 
@@ -1648,6 +1721,11 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
             char *node_disk_buf = offset_to_node(frontier_nhood.second, frontier_nhood.first);
             uint32_t *node_buf = offset_to_node_nhood(node_disk_buf);
             uint64_t nnbrs = (uint64_t)(*node_buf);
+            if (collect_trace)
+            {
+                iteration_trace.useful_payload_bytes += _disk_bytes_per_point + sizeof(uint32_t) * (1 + nnbrs);
+                iteration_trace.neighbors_seen += (uint32_t)nnbrs;
+            }
             T *node_fp_coords = offset_to_node_coords(node_disk_buf);
             memcpy(data_buf, node_fp_coords, _disk_bytes_per_point);
             float cur_expanded_dist;
@@ -1678,8 +1756,16 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
             for (uint64_t m = 0; m < nnbrs; ++m)
             {
                 uint32_t id = node_nbrs[m];
+                if (collect_trace)
+                {
+                    trace_unique_neighbors.insert(id);
+                }
                 if (visited.insert(id).second)
                 {
+                    if (collect_trace)
+                    {
+                        iteration_trace.new_visited++;
+                    }
                     if (!use_filter && _dummy_pts.find(id) != _dummy_pts.end())
                         continue;
 
@@ -1695,6 +1781,10 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
 
                     Neighbor nn(id, dist);
                     retset.insert(nn);
+                    if (collect_trace)
+                    {
+                        iteration_trace.candidates_inserted++;
+                    }
                 }
             }
 
@@ -1722,6 +1812,12 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
             }
         }
 
+        if (trace != nullptr)
+        {
+            iteration_trace.unique_neighbors = (uint32_t)trace_unique_neighbors.size();
+            iteration_trace.iteration_us = (float)iteration_timer.elapsed();
+            trace->iterations.push_back(iteration_trace);
+        }
         hops++;
     }
 

@@ -35,6 +35,32 @@ struct QueryStats
     unsigned n_hops = 0;       // # search hops
 };
 
+struct QueryIterationTrace
+{
+    uint32_t iteration = 0;
+    float iteration_us = 0;
+    float io_us = 0;
+
+    uint32_t cache_hits = 0;
+    uint32_t uncached_nodes = 0;
+    uint32_t issued_reads = 0;
+    uint32_t unique_sectors = 0;
+    uint32_t duplicate_sectors = 0;
+
+    uint64_t requested_bytes = 0;
+    uint64_t useful_payload_bytes = 0;
+
+    uint32_t neighbors_seen = 0;
+    uint32_t unique_neighbors = 0;
+    uint32_t new_visited = 0;
+    uint32_t candidates_inserted = 0;
+};
+
+struct QueryTrace
+{
+    std::vector<QueryIterationTrace> iterations;
+};
+
 template <typename T>
 inline T get_percentile_stats(QueryStats *stats, uint64_t len, float percentile,
                               const std::function<T(const QueryStats &)> &member_fn)
