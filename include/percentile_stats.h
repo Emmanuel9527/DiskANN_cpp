@@ -54,10 +54,18 @@ struct QueryIterationTrace
     uint32_t unique_neighbors = 0;
     uint32_t new_visited = 0;
     uint32_t candidates_inserted = 0;
+
+    uint32_t pq_computed = 0;
+    uint32_t pq_evaluated = 0;
+    uint32_t pq_passed = 0;
+    uint32_t entered_top_l = 0;
+    uint32_t eventually_expanded = 0;
+    uint32_t final_topk = 0;
 };
 
 struct QueryTrace
 {
+    bool enable_funnel = false;
     std::vector<QueryIterationTrace> iterations;
 };
 

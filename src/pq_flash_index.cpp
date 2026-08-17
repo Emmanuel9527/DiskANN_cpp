@@ -1419,6 +1419,24 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
     tsl::robin_set<uint64_t> frontier_sectors;
     tsl::robin_set<uint64_t> trace_read_sectors;
     tsl::robin_set<uint32_t> trace_unique_neighbors;
+    const bool collect_funnel = trace != nullptr && trace->enable_funnel;
+    tsl::robin_map<uint32_t, uint32_t> trace_first_entered_iteration;
+
+    auto trace_note_entered_top_l = [&](uint32_t id, uint32_t iteration) {
+        if (!collect_funnel)
+            return;
+        trace_first_entered_iteration.insert(std::make_pair(id, iteration));
+    };
+
+    auto trace_note_expanded = [&](uint32_t id) {
+        if (!collect_funnel)
+            return;
+        auto iter = trace_first_entered_iteration.find(id);
+        if (iter != trace_first_entered_iteration.end() && iter->second < trace->iterations.size())
+        {
+            trace->iterations[iter->second].eventually_expanded++;
+        }
+    };
 
     while (retset.has_unexpanded_node() && num_ios < io_limit)
     {
@@ -1449,6 +1467,7 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
             {
                 continue;
             }
+            trace_note_expanded(nbr.id);
             auto iter = _nhood_cache.find(nbr.id);
             if (iter != _nhood_cache.end())
             {
@@ -1573,6 +1592,10 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
             // compute node_nbrs <-> query dists in PQ space
             cpu_timer.reset();
             compute_dists(node_nbrs, nnbrs, dist_scratch);
+            if (collect_funnel)
+            {
+                iteration_trace.pq_computed += (uint32_t)nnbrs;
+            }
             if (stats != nullptr)
             {
                 stats->n_cmps += (uint32_t)nnbrs;
@@ -1596,10 +1619,20 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
                         (!_use_universal_label || !point_has_label(id, _universal_filter_label)))
                         continue;
                     cmps++;
+                    if (collect_funnel)
+                    {
+                        iteration_trace.pq_evaluated++;
+                    }
                     float dist = dist_scratch[m];
                     Neighbor nn(id, dist);
-                    retset.insert(nn);
-                    if (collect_trace)
+                    const bool inserted = retset.insert(nn);
+                    if (collect_funnel && inserted)
+                    {
+                        iteration_trace.pq_passed++;
+                        iteration_trace.entered_top_l++;
+                        trace_note_entered_top_l(id, iteration_trace.iteration);
+                    }
+                    if (collect_trace && (!collect_funnel || inserted))
                     {
                         iteration_trace.candidates_inserted++;
                     }
@@ -1642,6 +1675,7 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
 
                 expanded_nodes.insert(expanded_id);
                 visited.insert(expanded_id);
+                trace_note_expanded(expanded_id);
 
                 uint32_t *node_buf = offset_to_node_nhood(node_disk_buf);
                 uint64_t nnbrs = (uint64_t)(*node_buf);
@@ -1670,6 +1704,10 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
 
                 cpu_timer.reset();
                 compute_dists(node_nbrs, nnbrs, dist_scratch);
+                if (collect_funnel)
+                {
+                    iteration_trace.pq_computed += (uint32_t)nnbrs;
+                }
                 if (stats != nullptr)
                 {
                     stats->n_cmps += (uint32_t)nnbrs;
@@ -1697,6 +1735,10 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
                             (!_use_universal_label || !point_has_label(id, _universal_filter_label)))
                             continue;
                         cmps++;
+                        if (collect_funnel)
+                        {
+                            iteration_trace.pq_evaluated++;
+                        }
                         float dist = dist_scratch[m];
                         if (stats != nullptr)
                         {
@@ -1704,8 +1746,14 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
                         }
 
                         Neighbor nn(id, dist);
-                        retset.insert(nn);
-                        if (collect_trace)
+                        const bool inserted = retset.insert(nn);
+                        if (collect_funnel && inserted)
+                        {
+                            iteration_trace.pq_passed++;
+                            iteration_trace.entered_top_l++;
+                            trace_note_entered_top_l(id, iteration_trace.iteration);
+                        }
+                        if (collect_trace && (!collect_funnel || inserted))
                         {
                             iteration_trace.candidates_inserted++;
                         }
@@ -1745,6 +1793,10 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
             // compute node_nbrs <-> query dist in PQ space
             cpu_timer.reset();
             compute_dists(node_nbrs, nnbrs, dist_scratch);
+            if (collect_funnel)
+            {
+                iteration_trace.pq_computed += (uint32_t)nnbrs;
+            }
             if (stats != nullptr)
             {
                 stats->n_cmps += (uint32_t)nnbrs;
@@ -1773,6 +1825,10 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
                         (!_use_universal_label || !point_has_label(id, _universal_filter_label)))
                         continue;
                     cmps++;
+                    if (collect_funnel)
+                    {
+                        iteration_trace.pq_evaluated++;
+                    }
                     float dist = dist_scratch[m];
                     if (stats != nullptr)
                     {
@@ -1780,8 +1836,14 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
                     }
 
                     Neighbor nn(id, dist);
-                    retset.insert(nn);
-                    if (collect_trace)
+                    const bool inserted = retset.insert(nn);
+                    if (collect_funnel && inserted)
+                    {
+                        iteration_trace.pq_passed++;
+                        iteration_trace.entered_top_l++;
+                        trace_note_entered_top_l(id, iteration_trace.iteration);
+                    }
+                    if (collect_trace && (!collect_funnel || inserted))
                     {
                         iteration_trace.candidates_inserted++;
                     }
@@ -1872,6 +1934,18 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
         }
 
         std::sort(full_retset.begin(), full_retset.end());
+    }
+
+    if (collect_funnel)
+    {
+        for (uint64_t i = 0; i < k_search && i < full_retset.size(); i++)
+        {
+            auto iter = trace_first_entered_iteration.find(full_retset[i].id);
+            if (iter != trace_first_entered_iteration.end() && iter->second < trace->iterations.size())
+            {
+                trace->iterations[iter->second].final_topk++;
+            }
+        }
     }
 
     // copy k_search values

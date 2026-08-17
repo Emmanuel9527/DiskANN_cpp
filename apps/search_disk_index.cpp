@@ -70,7 +70,7 @@ static uint32_t trace_lifecycle_bin(uint32_t iteration, uint32_t total_iteration
 static void write_trace_csv(const std::string &trace_stats_csv, const std::string &trace_run_label,
                             const std::string &index_path_prefix, uint32_t L, uint32_t beamwidth,
                             uint32_t num_nodes_to_cache, bool use_sector_candidates,
-                            const std::vector<diskann::QueryTrace> &query_traces)
+                            const std::vector<diskann::QueryTrace> &query_traces, bool trace_funnel)
 {
     if (trace_stats_csv.empty())
         return;
@@ -88,7 +88,13 @@ static void write_trace_csv(const std::string &trace_stats_csv, const std::strin
                "iteration,total_iterations,lifecycle_bin,iteration_us,io_us,cache_hits,uncached_nodes,"
                "issued_reads,unique_sectors,duplicate_sectors,duplicate_sector_ratio,requested_bytes,"
                "useful_payload_bytes,overfetch_ratio,neighbors_seen,unique_neighbors,new_visited,"
-               "candidates_inserted\n";
+               "candidates_inserted";
+        if (trace_funnel)
+        {
+            out << ",pq_computed,pq_evaluated,pq_evaluated_ratio,pq_passed,pq_passed_ratio,entered_top_l,"
+                   "entered_top_l_ratio,eventually_expanded,eventually_expanded_ratio,final_topk,final_topk_ratio";
+        }
+        out << "\n";
     }
 
     for (uint32_t query_id = 0; query_id < query_traces.size(); query_id++)
@@ -105,6 +111,16 @@ static void write_trace_csv(const std::string &trace_stats_csv, const std::strin
             const double overfetch_ratio = iteration.useful_payload_bytes == 0
                                                ? 0.0
                                                : (double)iteration.requested_bytes / iteration.useful_payload_bytes;
+            const double pq_evaluated_ratio =
+                iteration.neighbors_seen == 0 ? 0.0 : (double)iteration.pq_evaluated / iteration.neighbors_seen;
+            const double pq_passed_ratio =
+                iteration.pq_evaluated == 0 ? 0.0 : (double)iteration.pq_passed / iteration.pq_evaluated;
+            const double entered_top_l_ratio =
+                iteration.pq_evaluated == 0 ? 0.0 : (double)iteration.entered_top_l / iteration.pq_evaluated;
+            const double eventually_expanded_ratio =
+                iteration.entered_top_l == 0 ? 0.0 : (double)iteration.eventually_expanded / iteration.entered_top_l;
+            const double final_topk_ratio =
+                iteration.entered_top_l == 0 ? 0.0 : (double)iteration.final_topk / iteration.entered_top_l;
             out << trace_run_label << ',' << index_path_prefix << ',' << L << ',' << beamwidth << ','
                 << num_nodes_to_cache << ',' << (use_sector_candidates ? 1 : 0) << ',' << query_id << ','
                 << iteration.iteration << ',' << total_iterations << ','
@@ -113,8 +129,15 @@ static void write_trace_csv(const std::string &trace_stats_csv, const std::strin
                 << iteration.issued_reads << ',' << iteration.unique_sectors << ',' << iteration.duplicate_sectors
                 << ',' << duplicate_sector_ratio << ',' << iteration.requested_bytes << ','
                 << iteration.useful_payload_bytes << ',' << overfetch_ratio << ',' << iteration.neighbors_seen << ','
-                << iteration.unique_neighbors << ',' << iteration.new_visited << ',' << iteration.candidates_inserted
-                << '\n';
+                << iteration.unique_neighbors << ',' << iteration.new_visited << ',' << iteration.candidates_inserted;
+            if (trace_funnel)
+            {
+                out << ',' << iteration.pq_computed << ',' << iteration.pq_evaluated << ',' << pq_evaluated_ratio
+                    << ',' << iteration.pq_passed << ',' << pq_passed_ratio << ',' << iteration.entered_top_l << ','
+                    << entered_top_l_ratio << ',' << iteration.eventually_expanded << ','
+                    << eventually_expanded_ratio << ',' << iteration.final_topk << ',' << final_topk_ratio;
+            }
+            out << '\n';
         }
     }
 }
@@ -129,7 +152,7 @@ int search_disk_index(diskann::Metric &metric, const std::string &index_path_pre
                       const std::string &result_new_to_old_map_file, const bool use_reorder_data = false,
                       const bool use_sector_candidates = false, const std::string &trace_stats_csv = std::string(""),
                       const uint32_t trace_sample_rate = 0, const uint32_t trace_max_queries = 0,
-                      const std::string &trace_run_label = std::string(""))
+                      const std::string &trace_run_label = std::string(""), const bool trace_funnel = false)
 {
     diskann::cout << "Search parameters: #threads: " << num_threads << ", ";
     if (beamwidth <= 0)
@@ -347,6 +370,7 @@ int search_disk_index(diskann::Metric &metric, const std::string &index_path_pre
                 if (trace_max_queries == 0 || sampled_query_index < trace_max_queries)
                 {
                     trace = &query_traces[(size_t)i];
+                    trace->enable_funnel = trace_funnel;
                 }
             }
 
@@ -455,7 +479,7 @@ int search_disk_index(diskann::Metric &metric, const std::string &index_path_pre
         if (collect_trace)
         {
             write_trace_csv(trace_stats_csv, trace_run_label, index_path_prefix, L, optimized_beamwidth,
-                            num_nodes_to_cache, use_sector_candidates, query_traces);
+                            num_nodes_to_cache, use_sector_candidates, query_traces, trace_funnel);
         }
 
         search_summaries.push_back({L, optimized_beamwidth, qps, mean_latency, latency_999, mean_ios, mean_io_us,
@@ -522,6 +546,7 @@ int main(int argc, char **argv)
     std::vector<uint32_t> Lvec;
     bool use_reorder_data = false;
     bool use_sector_candidates = false;
+    bool trace_funnel = false;
     float fail_if_recall_below = 0.0f;
 
     po::options_description desc{
@@ -602,6 +627,8 @@ int main(int argc, char **argv)
         optional_configs.add_options()("trace_run_label",
                                        po::value<std::string>(&trace_run_label)->default_value(""),
                                        "Optional label written into trace_stats_csv rows.");
+        optional_configs.add_options()("trace_funnel", po::bool_switch()->default_value(false),
+                                       "When trace_stats_csv is set, also collect neighbor survival funnel counters.");
 
         // Merge required and optional parameters
         desc.add(required_configs).add(optional_configs);
@@ -618,6 +645,8 @@ int main(int argc, char **argv)
             use_reorder_data = true;
         if (vm["use_sector_candidates"].as<bool>())
             use_sector_candidates = true;
+        if (vm["trace_funnel"].as<bool>())
+            trace_funnel = true;
     }
     catch (const std::exception &ex)
     {
@@ -685,19 +714,19 @@ int main(int argc, char **argv)
                     metric, index_path_prefix, result_path_prefix, query_file, gt_file, num_threads, K, W,
                     num_nodes_to_cache, search_io_limit, Lvec, fail_if_recall_below, query_filters, progress_interval,
                     result_new_to_old_map_file, use_reorder_data, use_sector_candidates, trace_stats_csv,
-                    trace_sample_rate, trace_max_queries, trace_run_label);
+                    trace_sample_rate, trace_max_queries, trace_run_label, trace_funnel);
             else if (data_type == std::string("int8"))
                 return search_disk_index<int8_t, uint16_t>(
                     metric, index_path_prefix, result_path_prefix, query_file, gt_file, num_threads, K, W,
                     num_nodes_to_cache, search_io_limit, Lvec, fail_if_recall_below, query_filters, progress_interval,
                     result_new_to_old_map_file, use_reorder_data, use_sector_candidates, trace_stats_csv,
-                    trace_sample_rate, trace_max_queries, trace_run_label);
+                    trace_sample_rate, trace_max_queries, trace_run_label, trace_funnel);
             else if (data_type == std::string("uint8"))
                 return search_disk_index<uint8_t, uint16_t>(
                     metric, index_path_prefix, result_path_prefix, query_file, gt_file, num_threads, K, W,
                     num_nodes_to_cache, search_io_limit, Lvec, fail_if_recall_below, query_filters, progress_interval,
                     result_new_to_old_map_file, use_reorder_data, use_sector_candidates, trace_stats_csv,
-                    trace_sample_rate, trace_max_queries, trace_run_label);
+                    trace_sample_rate, trace_max_queries, trace_run_label, trace_funnel);
             else
             {
                 std::cerr << "Unsupported data type. Use float or int8 or uint8" << std::endl;
@@ -712,21 +741,21 @@ int main(int argc, char **argv)
                                                 fail_if_recall_below, query_filters, progress_interval,
                                                 result_new_to_old_map_file, use_reorder_data, use_sector_candidates,
                                                 trace_stats_csv, trace_sample_rate, trace_max_queries,
-                                                trace_run_label);
+                                                trace_run_label, trace_funnel);
             else if (data_type == std::string("int8"))
                 return search_disk_index<int8_t>(metric, index_path_prefix, result_path_prefix, query_file, gt_file,
                                                  num_threads, K, W, num_nodes_to_cache, search_io_limit, Lvec,
                                                  fail_if_recall_below, query_filters, progress_interval,
                                                  result_new_to_old_map_file, use_reorder_data, use_sector_candidates,
                                                  trace_stats_csv, trace_sample_rate, trace_max_queries,
-                                                 trace_run_label);
+                                                 trace_run_label, trace_funnel);
             else if (data_type == std::string("uint8"))
                 return search_disk_index<uint8_t>(metric, index_path_prefix, result_path_prefix, query_file, gt_file,
                                                   num_threads, K, W, num_nodes_to_cache, search_io_limit, Lvec,
                                                   fail_if_recall_below, query_filters, progress_interval,
                                                   result_new_to_old_map_file, use_reorder_data, use_sector_candidates,
                                                   trace_stats_csv, trace_sample_rate, trace_max_queries,
-                                                  trace_run_label);
+                                                  trace_run_label, trace_funnel);
             else
             {
                 std::cerr << "Unsupported data type. Use float or int8 or uint8" << std::endl;
