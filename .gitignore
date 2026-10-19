@@ -359,14 +359,26 @@ cscope*
 build/
 build_linux/
 build_clean/
+/cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+compile_commands.json
+CMakeUserPresets.json
 !.github/actions/build
 
 # jetbrains specific stuff
 .idea/
 cmake-build-debug/
 
+# Local environment files
+.env
+.env.*
+!.env.example
+
 #python extension module ignores
 python/diskannpy.egg-info/
+.pytest_cache/
 python/dist/
 
 **/*.egg-info
@@ -375,7 +387,6 @@ dist/*
 venv*/**
 *.swp
 
-gperftools
 
 # DiskANN local datasets and experiment outputs
 /document/
@@ -407,4 +418,3 @@ index_block_shuffle/
 *.tar
 *.tar.gz
 *.tgz
-*.tex

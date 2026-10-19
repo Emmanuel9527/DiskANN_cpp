@@ -67,22 +67,46 @@ static uint32_t trace_lifecycle_bin(uint32_t iteration, uint32_t total_iteration
     return 5;
 }
 
-static void write_trace_csv(const std::string &trace_stats_csv, const std::string &trace_run_label,
-                            const std::string &index_path_prefix, uint32_t L, uint32_t beamwidth,
-                            uint32_t num_nodes_to_cache, bool use_sector_candidates,
-                            const std::vector<diskann::QueryTrace> &query_traces, bool trace_funnel)
+static void write_trace_csv(const std::string &trace_stats_csv, const std::string &trace_access_csv,
+                            const std::string &trace_run_label, const std::string &index_path_prefix,
+                            uint32_t L, uint32_t beamwidth, uint32_t num_nodes_to_cache,
+                            bool use_sector_candidates, const std::vector<diskann::QueryTrace> &query_traces,
+                            bool trace_funnel)
 {
-    if (trace_stats_csv.empty())
+    if (trace_stats_csv.empty() && trace_access_csv.empty())
         return;
 
-    const bool write_header = !file_exists(trace_stats_csv) || get_file_size(trace_stats_csv) == 0;
-    std::ofstream out(trace_stats_csv, std::ios::app);
-    if (!out)
+    std::ofstream out;
+    if (!trace_stats_csv.empty())
     {
-        throw diskann::ANNException("Could not open trace_stats_csv for writing: " + trace_stats_csv, -1);
+        out.open(trace_stats_csv, std::ios::app);
+        if (!out)
+            throw diskann::ANNException("Could not open trace_stats_csv for writing: " + trace_stats_csv, -1);
+    }
+    std::ofstream access_out;
+    if (!trace_access_csv.empty())
+    {
+        access_out.open(trace_access_csv, std::ios::app);
+        if (!access_out)
+            throw diskann::ANNException("Could not open trace_access_csv for writing: " + trace_access_csv, -1);
+        if (get_file_size(trace_access_csv) == 0)
+            access_out << "run_label,index_path_prefix,L,beamwidth,num_nodes_to_cache,use_sector_candidates,query_id,iteration,sequence,node_id,sector_id\n";
     }
 
-    if (write_header)
+    std::ofstream rerank_out;
+    const std::string rerank_csv = trace_access_csv.empty() ? std::string() : trace_access_csv + ".rerank_candidates.csv";
+    if (!rerank_csv.empty())
+    {
+        rerank_out.open(rerank_csv, std::ios::app);
+        if (!rerank_out)
+            throw diskann::ANNException("Could not open rerank candidate CSV for writing: " + rerank_csv, -1);
+        if (get_file_size(rerank_csv) == 0)
+            rerank_out << "run_label,index_path_prefix,L,beamwidth,num_nodes_to_cache,use_sector_candidates,query_id,rank,node_id,pq_distance\n";
+    }
+
+    const bool write_header = !trace_stats_csv.empty() &&
+                              (!file_exists(trace_stats_csv) || get_file_size(trace_stats_csv) == 0);
+    if (!trace_stats_csv.empty() && write_header)
     {
         out << "run_label,index_path_prefix,L,beamwidth,num_nodes_to_cache,use_sector_candidates,query_id,"
                "iteration,total_iterations,lifecycle_bin,iteration_us,io_us,cache_hits,uncached_nodes,"
@@ -104,8 +128,34 @@ static void write_trace_csv(const std::string &trace_stats_csv, const std::strin
         if (total_iterations == 0)
             continue;
 
+        if (rerank_out)
+        {
+            for (size_t rank = 0; rank < trace.rerank_candidates.size(); ++rank)
+            {
+                const auto &candidate = trace.rerank_candidates[rank];
+                rerank_out << trace_run_label << ',' << index_path_prefix << ',' << L << ',' << beamwidth << ','
+                           << num_nodes_to_cache << ',' << (use_sector_candidates ? 1 : 0) << ',' << query_id << ','
+                           << rank << ',' << candidate.node_id << ',' << candidate.pq_distance << '\n';
+            }
+        }
+
         for (const auto &iteration : trace.iterations)
         {
+            // Emit one row per submitted node read so the ordered sequence can be shuffled
+            // offline without rerunning search or changing the query's accessed-node set.
+            if (access_out)
+            {
+                for (size_t sequence = 0; sequence < iteration.node_accesses.size(); sequence++)
+                {
+                    const auto &access = iteration.node_accesses[sequence];
+                    access_out << trace_run_label << ',' << index_path_prefix << ',' << L << ',' << beamwidth << ','
+                               << num_nodes_to_cache << ',' << (use_sector_candidates ? 1 : 0) << ',' << query_id
+                               << ',' << iteration.iteration << ',' << sequence << ',' << access.node_id << ','
+                               << access.sector_id << '\n';
+                }
+            }
+            if (out)
+            {
             const double duplicate_sector_ratio =
                 iteration.issued_reads == 0 ? 0.0 : (double)iteration.duplicate_sectors / iteration.issued_reads;
             const double overfetch_ratio = iteration.useful_payload_bytes == 0
@@ -138,6 +188,7 @@ static void write_trace_csv(const std::string &trace_stats_csv, const std::strin
                     << eventually_expanded_ratio << ',' << iteration.final_topk << ',' << final_topk_ratio;
             }
             out << '\n';
+            }
         }
     }
 }
@@ -151,6 +202,7 @@ int search_disk_index(diskann::Metric &metric, const std::string &index_path_pre
                       const std::vector<std::string> &query_filters, const uint32_t progress_interval,
                       const std::string &result_new_to_old_map_file, const bool use_reorder_data = false,
                       const bool use_sector_candidates = false, const std::string &trace_stats_csv = std::string(""),
+                      const std::string &trace_access_csv = std::string(""),
                       const uint32_t trace_sample_rate = 0, const uint32_t trace_max_queries = 0,
                       const std::string &trace_run_label = std::string(""), const bool trace_funnel = false)
 {
@@ -174,12 +226,14 @@ int search_disk_index(diskann::Metric &metric, const std::string &index_path_pre
     float *gt_dists = nullptr;
     size_t query_num, query_dim, query_aligned_dim, gt_num, gt_dim;
     diskann::load_aligned_bin<T>(query_file, query, query_num, query_dim, query_aligned_dim);
-    const bool collect_trace = trace_stats_csv != std::string("");
+    const bool collect_trace = !trace_stats_csv.empty() || !trace_access_csv.empty();
     const uint32_t effective_trace_sample_rate = trace_sample_rate == 0 ? 1 : trace_sample_rate;
     if (collect_trace)
     {
-        diskann::cout << "Iteration trace enabled: csv=" << trace_stats_csv
-                      << ", sample_rate=" << effective_trace_sample_rate;
+        diskann::cout << "Iteration trace enabled";
+        if (!trace_stats_csv.empty()) diskann::cout << ": stats_csv=" << trace_stats_csv;
+        if (!trace_access_csv.empty()) diskann::cout << ", access_csv=" << trace_access_csv;
+        diskann::cout << ", sample_rate=" << effective_trace_sample_rate;
         if (trace_max_queries > 0)
             diskann::cout << ", max_queries=" << trace_max_queries;
         diskann::cout << std::endl;
@@ -478,8 +532,9 @@ int search_disk_index(diskann::Metric &metric, const std::string &index_path_pre
 
         if (collect_trace)
         {
-            write_trace_csv(trace_stats_csv, trace_run_label, index_path_prefix, L, optimized_beamwidth,
-                            num_nodes_to_cache, use_sector_candidates, query_traces, trace_funnel);
+            write_trace_csv(trace_stats_csv, trace_access_csv, trace_run_label, index_path_prefix, L,
+                            optimized_beamwidth, num_nodes_to_cache, use_sector_candidates, query_traces,
+                            trace_funnel);
         }
 
         search_summaries.push_back({L, optimized_beamwidth, qps, mean_latency, latency_999, mean_ios, mean_io_us,
@@ -540,7 +595,7 @@ int search_disk_index(diskann::Metric &metric, const std::string &index_path_pre
 int main(int argc, char **argv)
 {
     std::string data_type, dist_fn, index_path_prefix, result_path_prefix, query_file, gt_file, filter_label,
-        label_type, query_filters_file, result_new_to_old_map_file, trace_stats_csv, trace_run_label;
+        label_type, query_filters_file, result_new_to_old_map_file, trace_stats_csv, trace_access_csv, trace_run_label;
     uint32_t num_threads, K, W, num_nodes_to_cache, search_io_limit, progress_interval, trace_sample_rate,
         trace_max_queries;
     std::vector<uint32_t> Lvec;
@@ -618,6 +673,11 @@ int main(int argc, char **argv)
                                        po::value<std::string>(&trace_stats_csv)->default_value(""),
                                        "Optional CSV path for per-query, per-iteration locality tracing. Disabled by "
                                        "default.");
+        // Optional ordered access log; it shares query sampling with the iteration summary trace.
+        optional_configs.add_options()("trace_access_csv",
+                                       po::value<std::string>(&trace_access_csv)->default_value(""),
+                                       "Optional CSV path for ordered node/sector reads. Uses the same query sampling "
+                                       "options as trace_stats_csv.");
         optional_configs.add_options()("trace_sample_rate",
                                        po::value<uint32_t>(&trace_sample_rate)->default_value(1),
                                        "Trace every Nth query when trace_stats_csv is set. Default value: 1.");
@@ -713,19 +773,19 @@ int main(int argc, char **argv)
                 return search_disk_index<float, uint16_t>(
                     metric, index_path_prefix, result_path_prefix, query_file, gt_file, num_threads, K, W,
                     num_nodes_to_cache, search_io_limit, Lvec, fail_if_recall_below, query_filters, progress_interval,
-                    result_new_to_old_map_file, use_reorder_data, use_sector_candidates, trace_stats_csv,
+                    result_new_to_old_map_file, use_reorder_data, use_sector_candidates, trace_stats_csv, trace_access_csv,
                     trace_sample_rate, trace_max_queries, trace_run_label, trace_funnel);
             else if (data_type == std::string("int8"))
                 return search_disk_index<int8_t, uint16_t>(
                     metric, index_path_prefix, result_path_prefix, query_file, gt_file, num_threads, K, W,
                     num_nodes_to_cache, search_io_limit, Lvec, fail_if_recall_below, query_filters, progress_interval,
-                    result_new_to_old_map_file, use_reorder_data, use_sector_candidates, trace_stats_csv,
+                    result_new_to_old_map_file, use_reorder_data, use_sector_candidates, trace_stats_csv, trace_access_csv,
                     trace_sample_rate, trace_max_queries, trace_run_label, trace_funnel);
             else if (data_type == std::string("uint8"))
                 return search_disk_index<uint8_t, uint16_t>(
                     metric, index_path_prefix, result_path_prefix, query_file, gt_file, num_threads, K, W,
                     num_nodes_to_cache, search_io_limit, Lvec, fail_if_recall_below, query_filters, progress_interval,
-                    result_new_to_old_map_file, use_reorder_data, use_sector_candidates, trace_stats_csv,
+                    result_new_to_old_map_file, use_reorder_data, use_sector_candidates, trace_stats_csv, trace_access_csv,
                     trace_sample_rate, trace_max_queries, trace_run_label, trace_funnel);
             else
             {
@@ -740,21 +800,21 @@ int main(int argc, char **argv)
                                                 num_threads, K, W, num_nodes_to_cache, search_io_limit, Lvec,
                                                 fail_if_recall_below, query_filters, progress_interval,
                                                 result_new_to_old_map_file, use_reorder_data, use_sector_candidates,
-                                                trace_stats_csv, trace_sample_rate, trace_max_queries,
+                                                trace_stats_csv, trace_access_csv, trace_sample_rate, trace_max_queries,
                                                 trace_run_label, trace_funnel);
             else if (data_type == std::string("int8"))
                 return search_disk_index<int8_t>(metric, index_path_prefix, result_path_prefix, query_file, gt_file,
                                                  num_threads, K, W, num_nodes_to_cache, search_io_limit, Lvec,
                                                  fail_if_recall_below, query_filters, progress_interval,
                                                  result_new_to_old_map_file, use_reorder_data, use_sector_candidates,
-                                                 trace_stats_csv, trace_sample_rate, trace_max_queries,
+                                                 trace_stats_csv, trace_access_csv, trace_sample_rate, trace_max_queries,
                                                  trace_run_label, trace_funnel);
             else if (data_type == std::string("uint8"))
                 return search_disk_index<uint8_t>(metric, index_path_prefix, result_path_prefix, query_file, gt_file,
                                                   num_threads, K, W, num_nodes_to_cache, search_io_limit, Lvec,
                                                   fail_if_recall_below, query_filters, progress_interval,
                                                   result_new_to_old_map_file, use_reorder_data, use_sector_candidates,
-                                                  trace_stats_csv, trace_sample_rate, trace_max_queries,
+                                                  trace_stats_csv, trace_access_csv, trace_sample_rate, trace_max_queries,
                                                   trace_run_label, trace_funnel);
             else
             {

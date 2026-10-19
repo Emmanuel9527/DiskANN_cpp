@@ -1521,12 +1521,20 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
             for (uint64_t i = 0; i < frontier.size(); i++)
             {
                 auto id = frontier[i];
+                // Record only nodes actually submitted for SSD reads. The frontier order here is
+                // the host submission order; node_sector refers to the current index layout (e.g.
+                // block-shuffled sectors), not an FTL physical NAND address.
+                const uint64_t node_sector = get_node_sector((size_t)id);
+                if (collect_trace)
+                {
+                    iteration_trace.node_accesses.push_back({id, node_sector});
+                }
                 std::pair<uint32_t, char *> fnhood;
                 fnhood.first = id;
                 fnhood.second = sector_scratch + num_sectors_per_node * sector_scratch_idx * defaults::SECTOR_LEN;
                 sector_scratch_idx++;
                 frontier_nhoods.push_back(fnhood);
-                frontier_read_reqs.emplace_back(get_node_sector((size_t)id) * defaults::SECTOR_LEN,
+                frontier_read_reqs.emplace_back(node_sector * defaults::SECTOR_LEN,
                                                 num_sectors_per_node * defaults::SECTOR_LEN, fnhood.second);
                 if (collect_trace)
                 {
@@ -1897,6 +1905,15 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
         }
 
         std::vector<AlignedRead> vec_read_reqs;
+
+        // Preserve the approximate ranking so trace replay can vary the
+        // deferred exact-reranking ratio without changing traversal.
+        if (trace != nullptr)
+        {
+            trace->rerank_candidates.clear();
+            for (const auto &candidate : full_retset)
+                trace->rerank_candidates.push_back({candidate.id, candidate.distance});
+        }
 
         if (full_retset.size() > k_search * FULL_PRECISION_REORDER_MULTIPLIER)
             full_retset.erase(full_retset.begin() + k_search * FULL_PRECISION_REORDER_MULTIPLIER, full_retset.end());

@@ -35,9 +35,24 @@ struct QueryStats
     unsigned n_hops = 0;       // # search hops
 };
 
+// One uncached node read in the order it is submitted for a query iteration.
+// sector_id is the node's logical sector in the selected on-disk index layout.
+struct QueryNodeAccess
+{
+    uint32_t node_id = 0;
+    uint64_t sector_id = 0;
+};
+
+struct QueryRerankCandidate
+{
+    uint32_t node_id = 0;
+    float pq_distance = 0;
+};
+
 struct QueryIterationTrace
 {
     uint32_t iteration = 0;
+    std::vector<QueryNodeAccess> node_accesses;
     float iteration_us = 0;
     float io_us = 0;
 
@@ -67,6 +82,7 @@ struct QueryTrace
 {
     bool enable_funnel = false;
     std::vector<QueryIterationTrace> iterations;
+    std::vector<QueryRerankCandidate> rerank_candidates;
 };
 
 template <typename T>

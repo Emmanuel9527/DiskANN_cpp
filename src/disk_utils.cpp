@@ -1140,21 +1140,29 @@ void create_disk_layout(const std::string base_file, const std::string mem_index
 }
 
 static double calculate_block_locality_ratio(const std::vector<std::vector<uint32_t>> &graph,
-                                             const std::vector<uint32_t> &vertex_to_block)
+                                             const std::vector<uint32_t> &vertex_to_block,
+                                             const std::string &stage)
 {
     uint64_t total_edges = 0;
     uint64_t local_edges = 0;
+    const uint64_t npts = graph.size();
 
-    for (uint32_t u = 0; u < graph.size(); u++)
+    diskann::cout << "Block shuffling " << stage << " locality scan started (" << npts << " nodes)"
+                  << std::endl;
+
+#pragma omp parallel for reduction(+ : total_edges, local_edges) schedule(static)
+    for (int64_t u = 0; u < (int64_t)npts; u++)
     {
         for (const auto v : graph[u])
         {
-            total_edges++;
+            total_edges += 1;
             if (vertex_to_block[u] == vertex_to_block[v])
-                local_edges++;
+                local_edges += 1;
         }
     }
 
+    diskann::cout << "Block shuffling " << stage << " locality scan complete (" << npts << " nodes)"
+                  << std::endl;
     return total_edges == 0 ? 0.0 : (double)local_edges / (double)total_edges;
 }
 
@@ -1175,18 +1183,39 @@ static std::vector<uint32_t> compute_block_shuffled_order(const std::vector<std:
     std::vector<uint32_t> vertex_to_block(npts);
     std::vector<uint32_t> next_vertex_to_block(npts);
     std::vector<uint32_t> block_neighbor_counts(num_blocks, 0);
+    // These flags let the fallback placement find the first empty/non-full
+    // block without rescanning all blocks for every node. Block occupancy only
+    // grows during an iteration, so the cursors advance monotonically.
+    std::vector<uint8_t> empty_block(num_blocks, 1);
+    std::vector<uint8_t> nonfull_block(num_blocks, 1);
+    uint32_t first_empty_block = 0;
+    uint32_t first_nonfull_block = 0;
     std::vector<uint32_t> touched_blocks;
     touched_blocks.reserve(num_blocks);
+
+    auto append_node_to_block = [&](const uint32_t block_id, const uint32_t node_id)
+    {
+        blocks[block_id].push_back(node_id);
+        empty_block[block_id] = 0;
+        if (blocks[block_id].size() >= block_capacity)
+            nonfull_block[block_id] = 0;
+    };
 
     for (uint32_t u = 0; u < npts; u++)
         vertex_to_block[u] = (uint32_t)((uint64_t)u / block_capacity);
 
-    double previous_ratio = calculate_block_locality_ratio(graph, vertex_to_block);
+    double previous_ratio = calculate_block_locality_ratio(graph, vertex_to_block, "initial");
 
     for (uint32_t iter = 0; iter < max_iterations; iter++)
     {
         for (auto &block : blocks)
             block.clear();
+        std::fill(empty_block.begin(), empty_block.end(), 1);
+        std::fill(nonfull_block.begin(), nonfull_block.end(), 1);
+        first_empty_block = 0;
+        first_nonfull_block = 0;
+        const uint64_t progress_step = std::max<uint64_t>(1, (uint64_t)npts / 10);
+        diskann::cout << "Block shuffling iteration " << iter + 1 << ": placing nodes..." << std::endl;
 
         for (uint32_t u = 0; u < npts; u++)
         {
@@ -1218,7 +1247,7 @@ static std::vector<uint32_t> compute_block_shuffled_order(const std::vector<std:
 
                 if (blocks[best_block].size() < block_capacity)
                 {
-                    blocks[best_block].push_back(u);
+                    append_node_to_block(best_block, u);
                     placed = true;
                 }
 
@@ -1228,33 +1257,31 @@ static std::vector<uint32_t> compute_block_shuffled_order(const std::vector<std:
             if (!placed)
             {
                 uint32_t target_block = num_blocks;
-                for (uint32_t block_id = 0; block_id < num_blocks; block_id++)
+                while (first_empty_block < num_blocks && !empty_block[first_empty_block])
+                    first_empty_block++;
+                if (first_empty_block < num_blocks)
+                    target_block = first_empty_block;
+                else
                 {
-                    if (blocks[block_id].empty())
-                    {
-                        target_block = block_id;
-                        break;
-                    }
-                }
-
-                if (target_block == num_blocks)
-                {
-                    for (uint32_t block_id = 0; block_id < num_blocks; block_id++)
-                    {
-                        if (blocks[block_id].size() < block_capacity)
-                        {
-                            target_block = block_id;
-                            break;
-                        }
-                    }
+                    while (first_nonfull_block < num_blocks && !nonfull_block[first_nonfull_block])
+                        first_nonfull_block++;
+                    if (first_nonfull_block < num_blocks)
+                        target_block = first_nonfull_block;
                 }
 
                 assert(target_block != num_blocks);
-                blocks[target_block].push_back(u);
+                append_node_to_block(target_block, u);
             }
 
             for (const auto block_id : touched_blocks)
                 block_neighbor_counts[block_id] = 0;
+
+            if ((uint64_t)(u + 1) % progress_step == 0 || u + 1 == npts)
+            {
+                const uint32_t percent = (uint32_t)(((uint64_t)(u + 1) * 100) / npts);
+                diskann::cout << "Block shuffling iteration " << iter + 1 << ": placed " << (u + 1) << "/"
+                              << npts << " nodes (" << percent << "%)" << std::endl;
+            }
         }
 
         for (uint32_t block_id = 0; block_id < num_blocks; block_id++)
@@ -1263,7 +1290,8 @@ static std::vector<uint32_t> compute_block_shuffled_order(const std::vector<std:
                 next_vertex_to_block[u] = block_id;
         }
 
-        const double current_ratio = calculate_block_locality_ratio(graph, next_vertex_to_block);
+        const double current_ratio = calculate_block_locality_ratio(
+            graph, next_vertex_to_block, "iteration " + std::to_string(iter + 1));
         const double gain = current_ratio - previous_ratio;
         diskann::cout << "Block shuffling iteration " << iter + 1 << ": locality ratio=" << current_ratio
                       << ", gain=" << gain << std::endl;
@@ -1407,6 +1435,8 @@ void create_disk_layout_block_shuffling(const std::string base_file, const std::
     vamana_reader.read((char *)&vamana_frozen_num, sizeof(uint64_t));
 
     std::vector<std::vector<uint32_t>> graph(npts);
+    const uint32_t graph_progress_step = std::max<uint32_t>(1, npts / 10);
+    diskann::cout << "Loading Vamana graph for block shuffling..." << std::endl;
     for (uint32_t u = 0; u < npts; u++)
     {
         uint32_t nnbrs;
@@ -1431,6 +1461,13 @@ void create_disk_layout_block_shuffling(const std::string base_file, const std::
                 stream << "Node " << u << " has out-of-range neighbor " << v << " for npts=" << npts << std::endl;
                 throw diskann::ANNException(stream.str(), -1, __FUNCSIG__, __FILE__, __LINE__);
             }
+        }
+
+        if ((u + 1) % graph_progress_step == 0 || u + 1 == npts)
+        {
+            const uint32_t percent = (uint32_t)(((uint64_t)(u + 1) * 100) / npts);
+            diskann::cout << "Loaded " << (u + 1) << "/" << npts << " graph nodes (" << percent << "%)."
+                          << std::endl;
         }
     }
 
