@@ -53,6 +53,11 @@ struct QueryIterationTrace
 {
     uint32_t iteration = 0;
     std::vector<QueryNodeAccess> node_accesses;
+    // Process-wide steady-clock timestamps, in nanoseconds. Zero means not recorded.
+    uint64_t iteration_begin_ns = 0;
+    uint64_t iteration_end_ns = 0;
+    uint64_t read_begin_ns = 0;
+    uint64_t read_end_ns = 0;
     float iteration_us = 0;
     float io_us = 0;
 
@@ -80,6 +85,7 @@ struct QueryIterationTrace
 
 struct QueryTrace
 {
+    int worker_id = -1;
     bool enable_funnel = false;
     std::vector<QueryIterationTrace> iterations;
     std::vector<QueryRerankCandidate> rerank_candidates;

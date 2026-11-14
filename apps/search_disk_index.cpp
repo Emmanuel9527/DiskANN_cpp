@@ -112,7 +112,7 @@ static void write_trace_csv(const std::string &trace_stats_csv, const std::strin
                "iteration,total_iterations,lifecycle_bin,iteration_us,io_us,cache_hits,uncached_nodes,"
                "issued_reads,unique_sectors,duplicate_sectors,duplicate_sector_ratio,requested_bytes,"
                "useful_payload_bytes,overfetch_ratio,neighbors_seen,unique_neighbors,new_visited,"
-               "candidates_inserted";
+               "candidates_inserted,worker_id,iteration_begin_ns,iteration_end_ns,read_begin_ns,read_end_ns";
         if (trace_funnel)
         {
             out << ",pq_computed,pq_evaluated,pq_evaluated_ratio,pq_passed,pq_passed_ratio,entered_top_l,"
@@ -179,7 +179,9 @@ static void write_trace_csv(const std::string &trace_stats_csv, const std::strin
                 << iteration.issued_reads << ',' << iteration.unique_sectors << ',' << iteration.duplicate_sectors
                 << ',' << duplicate_sector_ratio << ',' << iteration.requested_bytes << ','
                 << iteration.useful_payload_bytes << ',' << overfetch_ratio << ',' << iteration.neighbors_seen << ','
-                << iteration.unique_neighbors << ',' << iteration.new_visited << ',' << iteration.candidates_inserted;
+                << iteration.unique_neighbors << ',' << iteration.new_visited << ',' << iteration.candidates_inserted
+                << ',' << trace.worker_id << ',' << iteration.iteration_begin_ns << ',' << iteration.iteration_end_ns
+                << ',' << iteration.read_begin_ns << ',' << iteration.read_end_ns;
             if (trace_funnel)
             {
                 out << ',' << iteration.pq_computed << ',' << iteration.pq_evaluated << ',' << pq_evaluated_ratio
@@ -424,6 +426,7 @@ int search_disk_index(diskann::Metric &metric, const std::string &index_path_pre
                 if (trace_max_queries == 0 || sampled_query_index < trace_max_queries)
                 {
                     trace = &query_traces[(size_t)i];
+                    trace->worker_id = omp_get_thread_num();
                     trace->enable_funnel = trace_funnel;
                 }
             }
@@ -539,6 +542,18 @@ int search_disk_index(diskann::Metric &metric, const std::string &index_path_pre
 
         search_summaries.push_back({L, optimized_beamwidth, qps, mean_latency, latency_999, mean_ios, mean_io_us,
                                     mean_cpuus, mean_cache_hits, mean_hops, cache_hit_rate, recall});
+        // Optional per-query counters, emitted after the timed search loop.
+        if (std::getenv("DISKANN_WRITE_QUERY_STATS") &&
+            std::string(std::getenv("DISKANN_WRITE_QUERY_STATS")) == "1")
+        {
+            std::ofstream counters(result_output_prefix + "_" + std::to_string(L) + "_stats.csv");
+            if (!counters)
+                throw std::runtime_error("Cannot write per-query search stats");
+            counters << "query_id,total_us,host_reads,host_4k_reads\n";
+            for (uint64_t i = 0; i < query_num; ++i)
+                counters << i << ',' << stats[i].total_us << ',' << stats[i].n_ios << ','
+                         << stats[i].n_4k << '\n';
+        }
         delete[] stats;
     }
 

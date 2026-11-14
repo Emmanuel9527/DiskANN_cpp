@@ -40,3 +40,8 @@ if (NOT MSVC)
             RUNTIME
     )
 endif()
+
+if (NOT MSVC)
+    add_executable(search_split_async ../experiments/split_async/search.cpp)
+    target_link_libraries(search_split_async ${PROJECT_NAME} ${DISKANN_ASYNC_LIB} ${DISKANN_TOOLS_TCMALLOC_LINK_OPTIONS})
+endif()

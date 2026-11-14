@@ -392,7 +392,7 @@ venv*/**
 /document/
 data/
 datasets/
-experiments/
+# experiments/ holds source and scripts (apps/CMakeLists.txt builds experiments/split_async/search.cpp); outputs go to results/
 results/
 index/
 index_baseline/
@@ -418,3 +418,7 @@ index_block_shuffle/
 *.tar
 *.tar.gz
 *.tgz
+
+# Block-layer traces (blktrace/blkparse) and converted replay traces
+*.blktrace.*
+*.blkparse.txt

@@ -1443,6 +1443,12 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
         Timer iteration_timer;
         diskann::QueryIterationTrace iteration_trace;
         const bool collect_trace = trace != nullptr;
+        auto trace_now_ns = []() -> uint64_t {
+            return std::chrono::duration_cast<std::chrono::nanoseconds>(
+                       std::chrono::steady_clock::now().time_since_epoch()).count();
+        };
+        if (collect_trace)
+            iteration_trace.iteration_begin_ns = trace_now_ns();
 
         // clear iteration state
         frontier.clear();
@@ -1548,12 +1554,16 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
                 num_ios++;
             }
             io_timer.reset();
+            if (collect_trace)
+                iteration_trace.read_begin_ns = trace_now_ns();
 #ifdef USE_BING_INFRA
             reader->read(frontier_read_reqs, ctx,
                          true); // asynhronous reader for Bing.
 #else
             reader->read(frontier_read_reqs, ctx); // synchronous IO linux
 #endif
+            if (collect_trace)
+                iteration_trace.read_end_ns = trace_now_ns();
             const float elapsed_io_us = (float)io_timer.elapsed();
             if (stats != nullptr)
             {
@@ -1886,6 +1896,7 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
         {
             iteration_trace.unique_neighbors = (uint32_t)trace_unique_neighbors.size();
             iteration_trace.iteration_us = (float)iteration_timer.elapsed();
+            iteration_trace.iteration_end_ns = trace_now_ns();
             trace->iterations.push_back(iteration_trace);
         }
         hops++;
