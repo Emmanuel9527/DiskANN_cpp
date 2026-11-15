@@ -9,6 +9,7 @@
 #include "neighbor.h"
 #include "parameters.h"
 #include "percentile_stats.h"
+#include "sim_search.h"
 #include "pq.h"
 #include "utils.h"
 #include "windows_customizations.h"
@@ -63,6 +64,16 @@ template <typename T, typename LabelT = uint32_t> class PQFlashIndex
     // With nominate == beam_width the chosen set equals the original beam.
     DISKANN_DLLEXPORT void set_frontier_nominate_policy(uint32_t nominate, float busy_prob,
                                                         uint32_t prefetch_buffer);
+
+    // N2: event-driven simulation of `workers` concurrent searches over `num_queries` queries (dynamic query
+    // assignment like OpenMP schedule(dynamic,1)). L2, unfiltered, no node cache, no reorder data. Results are
+    // written like cached_beam_search (k ids/dists per query). See sim_search.h.
+    DISKANN_DLLEXPORT void simulate_search(const T *queries, uint64_t num_queries, uint64_t query_aligned_dim,
+                                           uint64_t k_search, uint64_t l_search, uint64_t beam_width,
+                                           uint32_t workers, const SimHostProfile &host, const SimSSDParams &ssd,
+                                           const SimPolicy &policy, uint64_t seed, uint64_t *res_ids,
+                                           float *res_dists, std::vector<SimQueryResult> &per_query,
+                                           SimSummary &summary);
 
 #ifdef EXEC_ENV_OLS
     DISKANN_DLLEXPORT void generate_cache_list_from_sample_queries(MemoryMappedFiles &files, std::string sample_bin,

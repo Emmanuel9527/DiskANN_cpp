@@ -4,7 +4,10 @@
 #include "common_includes.h"
 
 #include "timer.h"
+#include <deque>
 #include <list>
+#include <queue>
+#include <random>
 #include "pq.h"
 #include "pq_scratch.h"
 #include "pq_flash_index.h"
@@ -2338,6 +2341,8 @@ template <typename T, typename LabelT> std::uint64_t PQFlashIndex<T, LabelT>::ge
 {
     return _max_degree;
 }
+
+#include "pq_flash_index_sim.inl"
 
 // instantiations
 template class PQFlashIndex<uint8_t>;
