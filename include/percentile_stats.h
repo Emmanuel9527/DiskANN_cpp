@@ -83,12 +83,31 @@ struct QueryIterationTrace
     uint32_t final_topk = 0;
 };
 
+// One neighbor seen while expanding a node (optional expansion log, used to replay the candidate list offline).
+// flags: bit0 neighbor was not visited before, bit1 inserted into the candidate list,
+//        bit2 parent came from the node cache, bit3 parent was a co-located sector node (use_sector_candidates).
+struct QueryExpansionRecord
+{
+    uint32_t iteration = 0;
+    uint32_t parent = 0;
+    uint32_t neighbor = 0;
+    float pq_distance = 0;
+    uint8_t flags = 0;
+};
+
 struct QueryTrace
 {
     int worker_id = -1;
     bool enable_funnel = false;
     std::vector<QueryIterationTrace> iterations;
     std::vector<QueryRerankCandidate> rerank_candidates;
+    // Optional expansion log (disabled by default).
+    bool enable_expansion_log = false;
+    uint32_t start_node = 0;
+    float start_pq_distance = 0;
+    std::vector<QueryExpansionRecord> expansions;
+    // Frontier candidates skipped because their parallel unit was already used in the same iteration.
+    uint64_t unit_conflicts_skipped = 0;
 };
 
 template <typename T>

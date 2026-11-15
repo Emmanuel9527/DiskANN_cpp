@@ -105,6 +105,17 @@ class NeighborPriorityQueue
         return _data[pre];
     }
 
+    // Marks the item at position i as expanded without requiring it to be the closest unexpanded one
+    // (used by frontier policies that skip some candidates and keep them for later iterations).
+    void mark_expanded(size_t i)
+    {
+        _data[i].expanded = true;
+        while (_cur < _size && _data[_cur].expanded)
+        {
+            _cur++;
+        }
+    }
+
     bool has_unexpanded_node() const
     {
         return _cur < _size;

@@ -46,6 +46,14 @@ template <typename T, typename LabelT = uint32_t> class PQFlashIndex
 
     DISKANN_DLLEXPORT void load_cache_list(std::vector<uint32_t> &node_list);
 
+    // Experimental frontier policy (disabled by default, unit_count = 0 keeps the original beam selection).
+    // When enabled, each iteration picks the closest unexpanded candidates such that no two uncached reads map to
+    // the same SSD parallel unit, unit(sector) = (sector / sectors_per_unit_page) % unit_count. Skipped candidates
+    // stay unexpanded for later iterations. scan_limit bounds how many unexpanded candidates are examined per
+    // iteration (0 = the whole candidate list).
+    DISKANN_DLLEXPORT void set_frontier_unit_policy(uint32_t unit_count, uint32_t sectors_per_unit_page,
+                                                    uint32_t scan_limit);
+
 #ifdef EXEC_ENV_OLS
     DISKANN_DLLEXPORT void generate_cache_list_from_sample_queries(MemoryMappedFiles &files, std::string sample_bin,
                                                                    uint64_t l_search, uint64_t beamwidth,
@@ -118,6 +126,7 @@ template <typename T, typename LabelT = uint32_t> class PQFlashIndex
     DISKANN_DLLEXPORT void setup_thread_data(uint64_t nthreads, uint64_t visited_reserve = 4096);
 
     DISKANN_DLLEXPORT void set_universal_label(const LabelT &label);
+
 
   private:
     DISKANN_DLLEXPORT inline bool point_has_label(uint32_t point_id, LabelT label_id);
@@ -223,6 +232,9 @@ template <typename T, typename LabelT = uint32_t> class PQFlashIndex
     uint64_t _max_nthreads;
     bool _load_flag = false;
     bool _count_visited_nodes = false;
+    uint32_t _frontier_unit_count = 0;
+    uint32_t _frontier_sectors_per_unit_page = 4;
+    uint32_t _frontier_scan_limit = 0;
     bool _reorder_data_exists = false;
     uint64_t _reoreder_data_offset = 0;
 

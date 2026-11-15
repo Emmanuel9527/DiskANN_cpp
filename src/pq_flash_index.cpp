@@ -753,6 +753,18 @@ template <typename T, typename LabelT> void PQFlashIndex<T, LabelT>::set_univers
     _universal_filter_label = label;
 }
 
+template <typename T, typename LabelT>
+void PQFlashIndex<T, LabelT>::set_frontier_unit_policy(uint32_t unit_count, uint32_t sectors_per_unit_page,
+                                                       uint32_t scan_limit)
+{
+    if (unit_count > 0 && sectors_per_unit_page == 0)
+        throw ANNException("sectors_per_unit_page must be > 0 when the frontier unit policy is enabled", -1,
+                           __FUNCSIG__, __FILE__, __LINE__);
+    _frontier_unit_count = unit_count;
+    _frontier_sectors_per_unit_page = sectors_per_unit_page;
+    _frontier_scan_limit = scan_limit;
+}
+
 #ifdef EXEC_ENV_OLS
 template <typename T, typename LabelT>
 int PQFlashIndex<T, LabelT>::load(MemoryMappedFiles &files, uint32_t num_threads, const char *index_prefix)
@@ -1401,6 +1413,11 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
     compute_dists(&best_medoid, 1, dist_scratch);
     retset.insert(Neighbor(best_medoid, dist_scratch[0]));
     visited.insert(best_medoid);
+    if (trace != nullptr && trace->enable_expansion_log)
+    {
+        trace->start_node = best_medoid;
+        trace->start_pq_distance = dist_scratch[0];
+    }
     tsl::robin_set<uint32_t> expanded_nodes;
 
     uint32_t cmps = 0;
@@ -1420,6 +1437,17 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
     tsl::robin_set<uint64_t> trace_read_sectors;
     tsl::robin_set<uint32_t> trace_unique_neighbors;
     const bool collect_funnel = trace != nullptr && trace->enable_funnel;
+    const bool collect_expansion = trace != nullptr && trace->enable_expansion_log;
+    // Optional expansion log: one record per neighbor seen while expanding a node (see QueryExpansionRecord).
+    auto log_expansion = [&](uint32_t parent, uint32_t neighbor, float pq_distance, bool is_new, uint8_t source) {
+        QueryExpansionRecord rec;
+        rec.iteration = hops;
+        rec.parent = parent;
+        rec.neighbor = neighbor;
+        rec.pq_distance = pq_distance;
+        rec.flags = (uint8_t)((is_new ? 1 : 0) | source);
+        trace->expansions.push_back(rec);
+    };
     tsl::robin_map<uint32_t, uint32_t> trace_first_entered_iteration;
 
     auto trace_note_entered_top_l = [&](uint32_t id, uint32_t iteration) {
@@ -1465,47 +1493,111 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
         sector_scratch_idx = 0;
         // find new beam
         uint32_t num_seen = 0;
-        while (retset.has_unexpanded_node() && frontier.size() < beam_width && num_seen < beam_width)
+        if (_frontier_unit_count > 0)
         {
-            auto nbr = retset.closest_unexpanded();
-            num_seen++;
-            if (use_sector_candidates && expanded_nodes.find(nbr.id) != expanded_nodes.end())
+            // Experimental: at most one uncached read per SSD parallel unit in this iteration.
+            std::vector<char> unit_used(_frontier_unit_count, 0);
+            uint32_t num_selected = 0, num_scanned = 0;
+            for (size_t pos = 0; pos < retset.size() && num_selected < beam_width; pos++)
             {
-                continue;
-            }
-            trace_note_expanded(nbr.id);
-            auto iter = _nhood_cache.find(nbr.id);
-            if (iter != _nhood_cache.end())
-            {
-                cached_nhoods.push_back(std::make_pair(nbr.id, iter->second));
-                if (collect_trace)
+                if (retset[pos].expanded)
+                    continue;
+                if (_frontier_scan_limit > 0 && num_scanned >= _frontier_scan_limit)
+                    break;
+                num_scanned++;
+                const uint32_t cand_id = retset[pos].id;
+                if (use_sector_candidates && expanded_nodes.find(cand_id) != expanded_nodes.end())
                 {
-                    iteration_trace.cache_hits++;
+                    retset.mark_expanded(pos);
+                    continue;
                 }
-                if (stats != nullptr)
+                auto iter = _nhood_cache.find(cand_id);
+                if (iter != _nhood_cache.end())
                 {
-                    stats->n_cache_hits++;
-                }
-            }
-            else
-            {
-                const uint64_t sector = get_node_sector(nbr.id);
-                if (use_sector_candidates && _nnodes_per_sector > 0)
-                {
-                    if (!frontier_sectors.insert(sector).second)
+                    retset.mark_expanded(pos);
+                    num_selected++;
+                    trace_note_expanded(cand_id);
+                    cached_nhoods.push_back(std::make_pair(cand_id, iter->second));
+                    if (collect_trace)
                     {
-                        continue;
+                        iteration_trace.cache_hits++;
+                    }
+                    if (stats != nullptr)
+                    {
+                        stats->n_cache_hits++;
                     }
                 }
-                if (collect_trace)
+                else
                 {
-                    trace_read_sectors.insert(sector);
+                    const uint64_t sector = get_node_sector(cand_id);
+                    const uint32_t unit =
+                        (uint32_t)((sector / _frontier_sectors_per_unit_page) % _frontier_unit_count);
+                    if (unit_used[unit])
+                    {
+                        if (trace != nullptr)
+                            trace->unit_conflicts_skipped++;
+                        continue; // stays unexpanded for a later iteration
+                    }
+                    unit_used[unit] = 1;
+                    retset.mark_expanded(pos);
+                    num_selected++;
+                    trace_note_expanded(cand_id);
+                    if (collect_trace)
+                    {
+                        trace_read_sectors.insert(sector);
+                    }
+                    frontier.push_back(cand_id);
                 }
-                frontier.push_back(nbr.id);
+                if (this->_count_visited_nodes)
+                {
+                    reinterpret_cast<std::atomic<uint32_t> &>(this->_node_visit_counter[cand_id].second).fetch_add(1);
+                }
             }
-            if (this->_count_visited_nodes)
+        }
+        else
+        {
+            while (retset.has_unexpanded_node() && frontier.size() < beam_width && num_seen < beam_width)
             {
-                reinterpret_cast<std::atomic<uint32_t> &>(this->_node_visit_counter[nbr.id].second).fetch_add(1);
+                auto nbr = retset.closest_unexpanded();
+                num_seen++;
+                if (use_sector_candidates && expanded_nodes.find(nbr.id) != expanded_nodes.end())
+                {
+                    continue;
+                }
+                trace_note_expanded(nbr.id);
+                auto iter = _nhood_cache.find(nbr.id);
+                if (iter != _nhood_cache.end())
+                {
+                    cached_nhoods.push_back(std::make_pair(nbr.id, iter->second));
+                    if (collect_trace)
+                    {
+                        iteration_trace.cache_hits++;
+                    }
+                    if (stats != nullptr)
+                    {
+                        stats->n_cache_hits++;
+                    }
+                }
+                else
+                {
+                    const uint64_t sector = get_node_sector(nbr.id);
+                    if (use_sector_candidates && _nnodes_per_sector > 0)
+                    {
+                        if (!frontier_sectors.insert(sector).second)
+                        {
+                            continue;
+                        }
+                    }
+                    if (collect_trace)
+                    {
+                        trace_read_sectors.insert(sector);
+                    }
+                    frontier.push_back(nbr.id);
+                }
+                if (this->_count_visited_nodes)
+                {
+                    reinterpret_cast<std::atomic<uint32_t> &>(this->_node_visit_counter[nbr.id].second).fetch_add(1);
+                }
             }
         }
 
@@ -1624,6 +1716,8 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
             for (uint64_t m = 0; m < nnbrs; ++m)
             {
                 uint32_t id = node_nbrs[m];
+                if (collect_expansion)
+                    log_expansion(cached_nhood.first, id, dist_scratch[m], visited.find(id) == visited.end(), 4);
                 if (visited.insert(id).second)
                 {
                     if (collect_trace)
@@ -1644,6 +1738,8 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
                     float dist = dist_scratch[m];
                     Neighbor nn(id, dist);
                     const bool inserted = retset.insert(nn);
+                    if (collect_expansion && inserted)
+                        trace->expansions.back().flags |= 2;
                     if (collect_funnel && inserted)
                     {
                         iteration_trace.pq_passed++;
@@ -1740,6 +1836,8 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
                     {
                         trace_unique_neighbors.insert(id);
                     }
+                    if (collect_expansion)
+                        log_expansion(expanded_id, id, dist_scratch[m], visited.find(id) == visited.end(), 8);
                     if (visited.insert(id).second)
                     {
                         if (collect_trace)
@@ -1765,6 +1863,8 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
 
                         Neighbor nn(id, dist);
                         const bool inserted = retset.insert(nn);
+                        if (collect_expansion && inserted)
+                            trace->expansions.back().flags |= 2;
                         if (collect_funnel && inserted)
                         {
                             iteration_trace.pq_passed++;
@@ -1830,6 +1930,8 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
                 {
                     trace_unique_neighbors.insert(id);
                 }
+                if (collect_expansion)
+                    log_expansion(frontier_nhood.first, id, dist_scratch[m], visited.find(id) == visited.end(), 0);
                 if (visited.insert(id).second)
                 {
                     if (collect_trace)
@@ -1855,6 +1957,8 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
 
                     Neighbor nn(id, dist);
                     const bool inserted = retset.insert(nn);
+                    if (collect_expansion && inserted)
+                        trace->expansions.back().flags |= 2;
                     if (collect_funnel && inserted)
                     {
                         iteration_trace.pq_passed++;

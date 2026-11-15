@@ -67,6 +67,53 @@ static uint32_t trace_lifecycle_bin(uint32_t iteration, uint32_t total_iteration
     return 5;
 }
 
+// Experimental options (all disabled by default; set from the command line in main()).
+struct ExperimentOptions
+{
+    std::string trace_expansion_bin; // expansion log path; empty = disabled
+    uint32_t frontier_unit_count = 0; // 0 = original beam selection
+    uint32_t frontier_sectors_per_unit_page = 4;
+    uint32_t frontier_scan_limit = 0;
+};
+static ExperimentOptions g_experiment;
+
+// Binary expansion log, appended per L value. Record layout (little endian, packed, 25 bytes):
+//   uint32 L, uint32 query_id, uint32 iteration, uint32 parent, uint32 neighbor, float32 pq_distance, uint8 flags
+// flags: bit0 neighbor newly visited, bit1 inserted into candidate list, bit2 parent from node cache,
+//        bit3 parent was a co-located sector node. Companion <path>.queries.csv has one row per traced query.
+static void write_expansion_log(const std::string &path, uint32_t L, const std::vector<diskann::QueryTrace> &traces)
+{
+    std::ofstream bin(path, std::ios::binary | std::ios::app);
+    if (!bin.is_open())
+        throw diskann::ANNException("Could not open trace_expansion_bin for writing: " + path, -1);
+    const std::string qpath = path + ".queries.csv";
+    const bool new_q = !file_exists(qpath) || get_file_size(qpath) == 0;
+    std::ofstream q(qpath, std::ios::app);
+    if (!q.is_open())
+        throw diskann::ANNException("Could not open expansion query CSV for writing: " + qpath, -1);
+    if (new_q)
+        q << "L,query_id,start_node,start_pq_distance,iterations,records,unit_conflicts_skipped\n";
+    for (size_t query_id = 0; query_id < traces.size(); query_id++)
+    {
+        const auto &t = traces[query_id];
+        if (!t.enable_expansion_log)
+            continue;
+        q << L << ',' << query_id << ',' << t.start_node << ',' << t.start_pq_distance << ',' << t.iterations.size()
+          << ',' << t.expansions.size() << ',' << t.unit_conflicts_skipped << '\n';
+        const uint32_t qid = (uint32_t)query_id;
+        for (const auto &r : t.expansions)
+        {
+            bin.write((const char *)&L, 4);
+            bin.write((const char *)&qid, 4);
+            bin.write((const char *)&r.iteration, 4);
+            bin.write((const char *)&r.parent, 4);
+            bin.write((const char *)&r.neighbor, 4);
+            bin.write((const char *)&r.pq_distance, 4);
+            bin.write((const char *)&r.flags, 1);
+        }
+    }
+}
+
 static void write_trace_csv(const std::string &trace_stats_csv, const std::string &trace_access_csv,
                             const std::string &trace_run_label, const std::string &index_path_prefix,
                             uint32_t L, uint32_t beamwidth, uint32_t num_nodes_to_cache,
@@ -228,7 +275,8 @@ int search_disk_index(diskann::Metric &metric, const std::string &index_path_pre
     float *gt_dists = nullptr;
     size_t query_num, query_dim, query_aligned_dim, gt_num, gt_dim;
     diskann::load_aligned_bin<T>(query_file, query, query_num, query_dim, query_aligned_dim);
-    const bool collect_trace = !trace_stats_csv.empty() || !trace_access_csv.empty();
+    const bool collect_trace =
+        !trace_stats_csv.empty() || !trace_access_csv.empty() || !g_experiment.trace_expansion_bin.empty();
     const uint32_t effective_trace_sample_rate = trace_sample_rate == 0 ? 1 : trace_sample_rate;
     if (collect_trace)
     {
@@ -295,6 +343,15 @@ int search_disk_index(diskann::Metric &metric, const std::string &index_path_pre
         new diskann::PQFlashIndex<T, LabelT>(reader, metric));
 
     int res = _pFlashIndex->load(num_threads, index_path_prefix.c_str());
+    if (g_experiment.frontier_unit_count > 0)
+    {
+        _pFlashIndex->set_frontier_unit_policy(g_experiment.frontier_unit_count,
+                                               g_experiment.frontier_sectors_per_unit_page,
+                                               g_experiment.frontier_scan_limit);
+        diskann::cout << "Frontier unit policy: enabled, units=" << g_experiment.frontier_unit_count
+                      << ", sectors_per_unit_page=" << g_experiment.frontier_sectors_per_unit_page
+                      << ", scan_limit=" << g_experiment.frontier_scan_limit << std::endl;
+    }
 
     if (res != 0)
     {
@@ -428,6 +485,7 @@ int search_disk_index(diskann::Metric &metric, const std::string &index_path_pre
                     trace = &query_traces[(size_t)i];
                     trace->worker_id = omp_get_thread_num();
                     trace->enable_funnel = trace_funnel;
+                    trace->enable_expansion_log = !g_experiment.trace_expansion_bin.empty();
                 }
             }
 
@@ -538,6 +596,8 @@ int search_disk_index(diskann::Metric &metric, const std::string &index_path_pre
             write_trace_csv(trace_stats_csv, trace_access_csv, trace_run_label, index_path_prefix, L,
                             optimized_beamwidth, num_nodes_to_cache, use_sector_candidates, query_traces,
                             trace_funnel);
+            if (!g_experiment.trace_expansion_bin.empty())
+                write_expansion_log(g_experiment.trace_expansion_bin, L, query_traces);
         }
 
         search_summaries.push_back({L, optimized_beamwidth, qps, mean_latency, latency_999, mean_ios, mean_io_us,
@@ -704,6 +764,21 @@ int main(int argc, char **argv)
                                        "Optional label written into trace_stats_csv rows.");
         optional_configs.add_options()("trace_funnel", po::bool_switch()->default_value(false),
                                        "When trace_stats_csv is set, also collect neighbor survival funnel counters.");
+        optional_configs.add_options()(
+            "trace_expansion_bin", po::value<std::string>(&g_experiment.trace_expansion_bin)->default_value(""),
+            "Experimental: binary log of every neighbor seen while expanding nodes (with PQ distance), for offline "
+            "candidate-list replay. Uses trace_sample_rate/trace_max_queries. Disabled by default.");
+        optional_configs.add_options()(
+            "frontier_unit_count", po::value<uint32_t>(&g_experiment.frontier_unit_count)->default_value(0),
+            "Experimental: pick at most one uncached read per SSD parallel unit per iteration; "
+            "unit = (sector / frontier_sectors_per_unit_page) % frontier_unit_count. 0 (default) = original beam.");
+        optional_configs.add_options()(
+            "frontier_sectors_per_unit_page",
+            po::value<uint32_t>(&g_experiment.frontier_sectors_per_unit_page)->default_value(4),
+            "Experimental: 4 KiB index sectors per flash page for frontier_unit_count (16 KiB page = 4).");
+        optional_configs.add_options()(
+            "frontier_scan_limit", po::value<uint32_t>(&g_experiment.frontier_scan_limit)->default_value(0),
+            "Experimental: max unexpanded candidates examined per iteration by the unit policy (0 = whole list).");
 
         // Merge required and optional parameters
         desc.add(required_configs).add(optional_configs);
