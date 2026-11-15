@@ -54,6 +54,16 @@ template <typename T, typename LabelT = uint32_t> class PQFlashIndex
     DISKANN_DLLEXPORT void set_frontier_unit_policy(uint32_t unit_count, uint32_t sectors_per_unit_page,
                                                     uint32_t scan_limit);
 
+    // Experimental "host nominates, SSD chooses" functional model (disabled by default, nominate = 0).
+    // Requires the unit policy mapping (set_frontier_unit_policy). Each iteration the top `nominate` unexpanded
+    // candidates are nominated; units are busy with probability busy_prob (deterministic hash of query, iteration,
+    // unit). The W reads are chosen in rank order among candidates on non-busy, not-yet-used units, then filled in
+    // rank order with the remaining nominees. Nominated-but-unchosen sectors enter a per-query LRU prefetch buffer
+    // of prefetch_buffer sectors (0 = no prefetch); later chosen reads found there count as prefetch hits.
+    // With nominate == beam_width the chosen set equals the original beam.
+    DISKANN_DLLEXPORT void set_frontier_nominate_policy(uint32_t nominate, float busy_prob,
+                                                        uint32_t prefetch_buffer);
+
 #ifdef EXEC_ENV_OLS
     DISKANN_DLLEXPORT void generate_cache_list_from_sample_queries(MemoryMappedFiles &files, std::string sample_bin,
                                                                    uint64_t l_search, uint64_t beamwidth,
@@ -235,6 +245,9 @@ template <typename T, typename LabelT = uint32_t> class PQFlashIndex
     uint32_t _frontier_unit_count = 0;
     uint32_t _frontier_sectors_per_unit_page = 4;
     uint32_t _frontier_scan_limit = 0;
+    uint32_t _frontier_nominate = 0;
+    float _frontier_busy_prob = 0;
+    uint32_t _frontier_prefetch_buffer = 0;
     bool _reorder_data_exists = false;
     uint64_t _reoreder_data_offset = 0;
 

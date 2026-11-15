@@ -4,6 +4,7 @@
 #include "common_includes.h"
 
 #include "timer.h"
+#include <list>
 #include "pq.h"
 #include "pq_scratch.h"
 #include "pq_flash_index.h"
@@ -765,6 +766,20 @@ void PQFlashIndex<T, LabelT>::set_frontier_unit_policy(uint32_t unit_count, uint
     _frontier_scan_limit = scan_limit;
 }
 
+template <typename T, typename LabelT>
+void PQFlashIndex<T, LabelT>::set_frontier_nominate_policy(uint32_t nominate, float busy_prob,
+                                                           uint32_t prefetch_buffer)
+{
+    if (nominate > 0 && _frontier_unit_count == 0)
+        throw ANNException("frontier_nominate requires frontier_unit_count > 0 (unit mapping)", -1, __FUNCSIG__,
+                           __FILE__, __LINE__);
+    if (busy_prob < 0 || busy_prob > 1)
+        throw ANNException("frontier_busy_prob must be in [0, 1]", -1, __FUNCSIG__, __FILE__, __LINE__);
+    _frontier_nominate = nominate;
+    _frontier_busy_prob = busy_prob;
+    _frontier_prefetch_buffer = prefetch_buffer;
+}
+
 #ifdef EXEC_ENV_OLS
 template <typename T, typename LabelT>
 int PQFlashIndex<T, LabelT>::load(MemoryMappedFiles &files, uint32_t num_threads, const char *index_prefix)
@@ -1420,6 +1435,41 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
     }
     tsl::robin_set<uint32_t> expanded_nodes;
 
+    // Experimental nominate/choose model state (unused unless _frontier_nominate > 0).
+    uint64_t nominate_query_seed = 1469598103934665603ULL; // FNV-1a over the query bytes
+    if (_frontier_nominate > 0)
+    {
+        const unsigned char *qb = reinterpret_cast<const unsigned char *>(aligned_query_T);
+        for (size_t b = 0; b < this->_data_dim * sizeof(T); b++)
+            nominate_query_seed = (nominate_query_seed ^ qb[b]) * 1099511628211ULL;
+    }
+    auto unit_is_busy = [&](uint32_t iteration, uint32_t unit) {
+        uint64_t z = nominate_query_seed ^ (((uint64_t)iteration << 32) | unit);
+        z += 0x9e3779b97f4a7c15ULL;
+        z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ULL;
+        z = (z ^ (z >> 27)) * 0x94d049bb133111ebULL;
+        z ^= z >> 31;
+        return (double)(z >> 11) * (1.0 / 9007199254740992.0) < (double)_frontier_busy_prob;
+    };
+    std::list<uint64_t> prefetch_lru;
+    tsl::robin_map<uint64_t, std::list<uint64_t>::iterator> prefetch_pos;
+    auto prefetch_insert = [&](uint64_t sector) {
+        auto it = prefetch_pos.find(sector);
+        if (it != prefetch_pos.end())
+        {
+            prefetch_lru.splice(prefetch_lru.begin(), prefetch_lru, it->second);
+            return false;
+        }
+        prefetch_lru.push_front(sector);
+        prefetch_pos[sector] = prefetch_lru.begin();
+        if (prefetch_lru.size() > _frontier_prefetch_buffer)
+        {
+            prefetch_pos.erase(prefetch_lru.back());
+            prefetch_lru.pop_back();
+        }
+        return true;
+    };
+
     uint32_t cmps = 0;
     uint32_t hops = 0;
     uint32_t num_ios = 0;
@@ -1493,7 +1543,92 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
         sector_scratch_idx = 0;
         // find new beam
         uint32_t num_seen = 0;
-        if (_frontier_unit_count > 0)
+        if (_frontier_nominate > 0)
+        {
+            // Experimental: host nominates the top-k unexpanded candidates, the SSD chooses W by unit state.
+            std::vector<size_t> nominees;
+            for (size_t pos = 0; pos < retset.size() && nominees.size() < _frontier_nominate; pos++)
+                if (!retset[pos].expanded)
+                    nominees.push_back(pos);
+            std::vector<char> chosen(nominees.size(), 0), unit_used(_frontier_unit_count, 0);
+            std::vector<uint64_t> nominee_sector(nominees.size(), 0);
+            std::vector<uint32_t> nominee_unit(nominees.size(), 0);
+            std::vector<char> nominee_cached(nominees.size(), 0);
+            for (size_t j = 0; j < nominees.size(); j++)
+            {
+                const uint32_t id = retset[nominees[j]].id;
+                nominee_cached[j] = _nhood_cache.find(id) != _nhood_cache.end();
+                nominee_sector[j] = get_node_sector(id);
+                nominee_unit[j] = (uint32_t)((nominee_sector[j] / _frontier_sectors_per_unit_page) % _frontier_unit_count);
+            }
+            uint32_t num_selected = 0;
+            for (int pass = 0; pass < 2 && num_selected < beam_width; pass++)
+            {
+                for (size_t j = 0; j < nominees.size() && num_selected < beam_width; j++)
+                {
+                    if (chosen[j])
+                        continue;
+                    if (pass == 0 && !nominee_cached[j] &&
+                        (unit_used[nominee_unit[j]] || unit_is_busy(hops, nominee_unit[j])))
+                        continue;
+                    chosen[j] = 1;
+                    num_selected++;
+                    if (!nominee_cached[j])
+                        unit_used[nominee_unit[j]] = 1;
+                }
+            }
+            bool busy_round = false;
+            for (size_t j = 0; j < nominees.size(); j++)
+            {
+                const uint32_t cand_id = retset[nominees[j]].id;
+                if (!chosen[j])
+                    continue;
+                if (use_sector_candidates && expanded_nodes.find(cand_id) != expanded_nodes.end())
+                {
+                    retset.mark_expanded(nominees[j]);
+                    continue;
+                }
+                retset.mark_expanded(nominees[j]);
+                trace_note_expanded(cand_id);
+                if (nominee_cached[j])
+                {
+                    cached_nhoods.push_back(std::make_pair(cand_id, _nhood_cache.find(cand_id)->second));
+                    if (collect_trace)
+                        iteration_trace.cache_hits++;
+                    if (stats != nullptr)
+                        stats->n_cache_hits++;
+                }
+                else
+                {
+                    const bool busy = unit_is_busy(hops, nominee_unit[j]);
+                    busy_round = busy_round || busy;
+                    if (stats != nullptr)
+                    {
+                        if (busy)
+                            stats->n_busy_reads++;
+                        if (_frontier_prefetch_buffer > 0 &&
+                            prefetch_pos.find(nominee_sector[j]) != prefetch_pos.end())
+                            stats->n_prefetch_hits++;
+                    }
+                    if (collect_trace)
+                        trace_read_sectors.insert(nominee_sector[j]);
+                    frontier.push_back(cand_id);
+                }
+                if (this->_count_visited_nodes)
+                {
+                    reinterpret_cast<std::atomic<uint32_t> &>(this->_node_visit_counter[cand_id].second).fetch_add(1);
+                }
+            }
+            if (stats != nullptr && busy_round)
+                stats->n_busy_rounds++;
+            if (_frontier_prefetch_buffer > 0)
+            {
+                for (size_t j = 0; j < nominees.size(); j++)
+                    if (!chosen[j] && !nominee_cached[j] && prefetch_insert(nominee_sector[j]) && stats != nullptr)
+                        stats->n_prefetch_issued++;
+            }
+        }
+        else if (_frontier_unit_count > 0)
         {
             // Experimental: at most one uncached read per SSD parallel unit in this iteration.
             std::vector<char> unit_used(_frontier_unit_count, 0);

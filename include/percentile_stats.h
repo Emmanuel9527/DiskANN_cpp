@@ -33,6 +33,11 @@ struct QueryStats
     unsigned n_cmps = 0;       // # cmps
     unsigned n_cache_hits = 0; // # cache_hits
     unsigned n_hops = 0;       // # search hops
+    // Experimental nominate/choose policy counters (zero unless --frontier_nominate is used).
+    unsigned n_busy_reads = 0;      // uncached reads issued to a unit marked busy
+    unsigned n_busy_rounds = 0;     // iterations with at least one such read
+    unsigned n_prefetch_issued = 0; // nominated-but-not-chosen sectors put into the prefetch buffer
+    unsigned n_prefetch_hits = 0;   // chosen reads whose sector was already in the prefetch buffer
 };
 
 // One uncached node read in the order it is submitted for a query iteration.

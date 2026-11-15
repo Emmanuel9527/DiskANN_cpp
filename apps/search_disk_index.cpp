@@ -74,6 +74,9 @@ struct ExperimentOptions
     uint32_t frontier_unit_count = 0; // 0 = original beam selection
     uint32_t frontier_sectors_per_unit_page = 4;
     uint32_t frontier_scan_limit = 0;
+    uint32_t frontier_nominate = 0;
+    float frontier_busy_prob = 0;
+    uint32_t frontier_prefetch_buffer = 0;
 };
 static ExperimentOptions g_experiment;
 
@@ -352,6 +355,14 @@ int search_disk_index(diskann::Metric &metric, const std::string &index_path_pre
                       << ", sectors_per_unit_page=" << g_experiment.frontier_sectors_per_unit_page
                       << ", scan_limit=" << g_experiment.frontier_scan_limit << std::endl;
     }
+    if (g_experiment.frontier_nominate > 0)
+    {
+        _pFlashIndex->set_frontier_nominate_policy(g_experiment.frontier_nominate, g_experiment.frontier_busy_prob,
+                                                   g_experiment.frontier_prefetch_buffer);
+        diskann::cout << "Frontier nominate policy: nominate=" << g_experiment.frontier_nominate
+                      << ", busy_prob=" << g_experiment.frontier_busy_prob
+                      << ", prefetch_buffer=" << g_experiment.frontier_prefetch_buffer << std::endl;
+    }
 
     if (res != 0)
     {
@@ -600,6 +611,24 @@ int search_disk_index(diskann::Metric &metric, const std::string &index_path_pre
                 write_expansion_log(g_experiment.trace_expansion_bin, L, query_traces);
         }
 
+        if (g_experiment.frontier_nominate > 0)
+        {
+            double busy_reads = 0, busy_rounds = 0, pf_issued = 0, pf_hits = 0, hops_sum = 0, ios_sum = 0;
+            for (size_t qi = 0; qi < query_num; qi++)
+            {
+                busy_reads += stats[qi].n_busy_reads;
+                busy_rounds += stats[qi].n_busy_rounds;
+                pf_issued += stats[qi].n_prefetch_issued;
+                pf_hits += stats[qi].n_prefetch_hits;
+                hops_sum += stats[qi].n_hops;
+                ios_sum += stats[qi].n_ios;
+            }
+            diskann::cout << "[nominate] L=" << L << " W=" << optimized_beamwidth
+                          << " busy_round_pct=" << (hops_sum > 0 ? 100.0 * busy_rounds / hops_sum : 0)
+                          << " busy_read_pct=" << (ios_sum > 0 ? 100.0 * busy_reads / ios_sum : 0)
+                          << " prefetch_issued_per_query=" << pf_issued / query_num
+                          << " prefetch_hit_pct=" << (ios_sum > 0 ? 100.0 * pf_hits / ios_sum : 0) << std::endl;
+        }
         search_summaries.push_back({L, optimized_beamwidth, qps, mean_latency, latency_999, mean_ios, mean_io_us,
                                     mean_cpuus, mean_cache_hits, mean_hops, cache_hit_rate, recall});
         // Optional per-query counters, emitted after the timed search loop.
@@ -776,6 +805,16 @@ int main(int argc, char **argv)
             "frontier_sectors_per_unit_page",
             po::value<uint32_t>(&g_experiment.frontier_sectors_per_unit_page)->default_value(4),
             "Experimental: 4 KiB index sectors per flash page for frontier_unit_count (16 KiB page = 4).");
+        optional_configs.add_options()(
+            "frontier_nominate", po::value<uint32_t>(&g_experiment.frontier_nominate)->default_value(0),
+            "Experimental functional model of host-nominates/SSD-chooses: nominate the top-k unexpanded candidates "
+            "and choose W on non-busy units (needs frontier_unit_count). 0 (default) = off.");
+        optional_configs.add_options()(
+            "frontier_busy_prob", po::value<float>(&g_experiment.frontier_busy_prob)->default_value(0),
+            "Experimental: probability that a unit is busy in an iteration (deterministic per query/iteration/unit).");
+        optional_configs.add_options()(
+            "frontier_prefetch_buffer", po::value<uint32_t>(&g_experiment.frontier_prefetch_buffer)->default_value(0),
+            "Experimental: per-query LRU prefetch buffer (sectors) for nominated-but-unchosen candidates. 0 = off.");
         optional_configs.add_options()(
             "frontier_scan_limit", po::value<uint32_t>(&g_experiment.frontier_scan_limit)->default_value(0),
             "Experimental: max unexpanded candidates examined per iteration by the unit policy (0 = whole list).");
