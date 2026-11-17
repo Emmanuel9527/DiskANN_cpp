@@ -1,6 +1,10 @@
 // N2: event-driven simulation of concurrent searches (included by pq_flash_index.cpp before the instantiations).
 // Functional part = the original unfiltered L2 beam search of cached_beam_search; timing = simulated SSD + host
-// profile. With policy.nominate == 0 the visited nodes and results equal cached_beam_search (same L, W).
+// profile. With policy.nominate == 0 the visited nodes and results equal cached_beam_search (same L, W, cache).
+// Node cache (load_cache_list before the call): a cached nominee takes one of the W slots like in
+// cached_beam_search, is always "free" for the SSD choice, is never read or prefetched, and is expanded from the
+// cache. A round whose chosen nodes are all cached issues no read and costs no simulated time: the measured host
+// profiles (build_closed_loop_schedule.py) fold such rounds into the gap before the next round that reads.
 
 template <typename T, typename LabelT>
 void PQFlashIndex<T, LabelT>::simulate_search(const T *queries, uint64_t num_queries, uint64_t query_aligned_dim,
@@ -10,9 +14,8 @@ void PQFlashIndex<T, LabelT>::simulate_search(const T *queries, uint64_t num_que
                                               uint64_t *res_ids, float *res_dists,
                                               std::vector<SimQueryResult> &per_query, SimSummary &summary)
 {
-    if (metric != diskann::Metric::L2 || _use_disk_index_pq || !_nhood_cache.empty())
-        throw ANNException("simulate_search supports L2, no disk PQ, no node cache", -1, __FUNCSIG__, __FILE__,
-                           __LINE__);
+    if (metric != diskann::Metric::L2 || _use_disk_index_pq)
+        throw ANNException("simulate_search supports L2 without disk PQ", -1, __FUNCSIG__, __FILE__, __LINE__);
     if (policy.nominate > 0 && policy.nominate < beam_width)
         throw ANNException("nominate must be 0 or >= beam_width", -1, __FUNCSIG__, __FILE__, __LINE__);
     if (host.gap_us.empty() || host.first_gap_us.empty())
@@ -90,6 +93,15 @@ void PQFlashIndex<T, LabelT>::simulate_search(const T *queries, uint64_t num_que
             out.push_back(std::move(nd));
         }
     };
+    auto cached_node = [&](uint32_t id, std::vector<Node> &out) {
+        const auto nh = _nhood_cache.find(id)->second;
+        const T *c = _coord_cache.find(id)->second;
+        Node nd;
+        nd.id = id;
+        nd.coords.assign(c, c + _data_dim);
+        nd.nbrs.assign(nh.second, nh.second + nh.first);
+        out.push_back(std::move(nd));
+    };
     auto start_query = [&](Worker &w, int64_t q) {
         w.query = q;
         w.retset.clear();
@@ -140,6 +152,14 @@ void PQFlashIndex<T, LabelT>::simulate_search(const T *queries, uint64_t num_que
             }
         }
         w.round_nodes.clear();
+    };
+    // host side of a round: the k top unexpanded candidates (k = W for the original beam)
+    auto nominate = [&](Worker &w) {
+        w.nominee_pos.clear();
+        const uint32_t k = policy.nominate > 0 ? policy.nominate : (uint32_t)beam_width;
+        for (size_t pos = 0; pos < w.retset.size() && w.nominee_pos.size() < k; pos++)
+            if (!w.retset[pos].expanded)
+                w.nominee_pos.push_back(pos);
     };
     auto finish_query = [&](Worker &w) {
         std::sort(w.full.begin(), w.full.end());
@@ -306,66 +326,95 @@ void PQFlashIndex<T, LabelT>::simulate_search(const T *queries, uint64_t num_que
             break;
         }
         case ROUND_START: {
-            Worker &w = ws[ev.a];
-            w.nominee_pos.clear();
-            const uint32_t k = policy.nominate > 0 ? policy.nominate : (uint32_t)beam_width;
-            for (size_t pos = 0; pos < w.retset.size() && w.nominee_pos.size() < k; pos++)
-                if (!w.retset[pos].expanded)
-                    w.nominee_pos.push_back(pos);
+            nominate(ws[ev.a]);
             push(t + host.pre_us, SSD_CHOOSE, ev.a);
             break;
         }
         case SSD_CHOOSE: {
             Worker &w = ws[ev.a];
-            const size_t n = w.nominee_pos.size();
-            std::vector<char> chosen(n, 0);
-            std::vector<uint64_t> sec(n);
-            std::vector<uint32_t> extra(ssd.units, 0);
-            for (size_t j = 0; j < n; j++)
-                sec[j] = get_node_sector(w.retset[w.nominee_pos[j]].id);
-            uint32_t picked = 0;
-            if (policy.nominate == 0 || !policy.avoid_busy)
+            // A round served entirely from the node cache is expanded at once and the next round is chosen at the
+            // same instant (no pre time: the measured profile has none for rounds without reads).
+            for (;;)
             {
-                for (size_t j = 0; j < n && picked < beam_width; j++)
-                    chosen[j] = 1, picked++;
-            }
-            else
-            {
-                for (int pass = 0; pass < 2 && picked < beam_width; pass++)
-                    for (size_t j = 0; j < n && picked < beam_width; j++)
-                    {
-                        if (chosen[j])
-                            continue;
-                        const uint32_t u = unit_of(sec[j]);
-                        if (pass == 0 && !buffer_has(sec[j]) && est_wait(u, t, extra[u]) > policy.wait_threshold_us)
-                            continue;
-                        chosen[j] = 1;
-                        picked++;
-                        if (!buffer_has(sec[j]))
-                            extra[u]++;
-                    }
-            }
-            chosen_ids.clear();
-            chosen_secs.clear();
-            for (size_t j = 0; j < n; j++)
-                if (chosen[j])
-                {
-                    w.retset.mark_expanded(w.nominee_pos[j]);
-                    chosen_ids.push_back(w.retset[w.nominee_pos[j]].id);
-                    chosen_secs.push_back(sec[j]);
-                }
-            read_nodes(chosen_ids, w.round_nodes); // functional contents; timing below
-            per_query[w.query].rounds++;
-            per_query[w.query].reads += (uint32_t)chosen_ids.size();
-            w.outstanding = (uint32_t)chosen_ids.size();
-            w.round_first_arrival = t;
-            for (size_t i = 0; i < chosen_secs.size(); i++)
-                push(t + host.spacing_us * i, ARRIVE, new_read(ev.a, chosen_secs[i], false, t + host.spacing_us * i));
-            if (policy.prefetch_buffer > 0)
+                const size_t n = w.nominee_pos.size();
+                std::vector<char> chosen(n, 0), cached(n, 0);
+                std::vector<uint64_t> sec(n);
+                std::vector<uint32_t> extra(ssd.units, 0);
                 for (size_t j = 0; j < n; j++)
-                    if (!chosen[j])
-                        push(t + host.spacing_us * chosen_secs.size(), ARRIVE,
-                             new_read(ev.a, sec[j], true, t + host.spacing_us * chosen_secs.size()));
+                {
+                    const uint32_t id = w.retset[w.nominee_pos[j]].id;
+                    sec[j] = get_node_sector(id);
+                    cached[j] = !_nhood_cache.empty() && _nhood_cache.find(id) != _nhood_cache.end();
+                }
+                uint32_t picked = 0;
+                if (policy.nominate == 0 || !policy.avoid_busy)
+                {
+                    for (size_t j = 0; j < n && picked < beam_width; j++)
+                        chosen[j] = 1, picked++;
+                }
+                else
+                {
+                    for (int pass = 0; pass < 2 && picked < beam_width; pass++)
+                        for (size_t j = 0; j < n && picked < beam_width; j++)
+                        {
+                            if (chosen[j])
+                                continue;
+                            const uint32_t u = unit_of(sec[j]);
+                            if (pass == 0 && !cached[j] && !buffer_has(sec[j]) &&
+                                est_wait(u, t, extra[u]) > policy.wait_threshold_us)
+                                continue;
+                            chosen[j] = 1;
+                            picked++;
+                            if (!cached[j] && !buffer_has(sec[j]))
+                                extra[u]++;
+                        }
+                }
+                chosen_ids.clear();
+                chosen_secs.clear();
+                for (size_t j = 0; j < n; j++)
+                    if (chosen[j])
+                    {
+                        w.retset.mark_expanded(w.nominee_pos[j]);
+                        const uint32_t id = w.retset[w.nominee_pos[j]].id;
+                        if (cached[j])
+                        {
+                            cached_node(id, w.round_nodes);
+                            per_query[w.query].cache_hits++;
+                            summary.cache_hits++;
+                            continue;
+                        }
+                        chosen_ids.push_back(id);
+                        chosen_secs.push_back(sec[j]);
+                    }
+                if (!chosen_ids.empty())
+                {
+                    read_nodes(chosen_ids, w.round_nodes); // functional contents; timing below
+                    per_query[w.query].rounds++;
+                    per_query[w.query].reads += (uint32_t)chosen_ids.size();
+                    w.outstanding = (uint32_t)chosen_ids.size();
+                    w.round_first_arrival = t;
+                    for (size_t i = 0; i < chosen_secs.size(); i++)
+                        push(t + host.spacing_us * i, ARRIVE,
+                             new_read(ev.a, chosen_secs[i], false, t + host.spacing_us * i));
+                    if (policy.prefetch_buffer > 0)
+                        for (size_t j = 0; j < n; j++)
+                            if (!chosen[j] && !cached[j])
+                                push(t + host.spacing_us * chosen_secs.size(), ARRIVE,
+                                     new_read(ev.a, sec[j], true, t + host.spacing_us * chosen_secs.size()));
+                    break;
+                }
+                summary.cache_only_rounds++;
+                expand_round(w);
+                if (!w.retset.has_unexpanded_node())
+                {
+                    finish_query(w);
+                    per_query[w.query].end_us = t;
+                    summary.end_us = (std::max)(summary.end_us, t);
+                    push(t, QUERY_START, ev.a);
+                    break;
+                }
+                nominate(w);
+            }
             break;
         }
         case ARRIVE: {

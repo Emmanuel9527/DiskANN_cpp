@@ -45,7 +45,7 @@ struct SimPolicy
 struct SimQueryResult
 {
     double start_us = 0, end_us = 0;
-    uint32_t worker = 0, rounds = 0, reads = 0, buffer_hits = 0, prefetch_waits = 0;
+    uint32_t worker = 0, rounds = 0, reads = 0, buffer_hits = 0, prefetch_waits = 0, cache_hits = 0;
 };
 
 struct SimSummary
@@ -53,6 +53,7 @@ struct SimSummary
     double end_us = 0;
     uint64_t critical_reads = 0, flash_reads = 0, prefetch_issued = 0, prefetch_dropped = 0, prefetch_completed = 0;
     uint64_t buffer_hits = 0, prefetch_waits = 0, prefetch_promoted = 0;
+    uint64_t cache_hits = 0, cache_only_rounds = 0; // node-cache hits; rounds that needed no read
     double unit_busy_us = 0;
     std::vector<float> read_wait_us;   // critical flash reads: SSD arrival -> start of service
     std::vector<float> read_latency_us; // critical reads: SSD arrival -> completion seen by host side

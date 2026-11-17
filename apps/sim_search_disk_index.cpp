@@ -60,7 +60,7 @@ static double mean(const std::vector<float> &v)
 
 template <typename T>
 int run(const std::string &prefix, const std::string &query_file, const std::string &gt_file, uint32_t K, uint32_t L,
-        uint32_t W, uint32_t workers, uint64_t nq_limit, const diskann::SimHostProfile &host,
+        uint32_t W, uint32_t workers, uint64_t nq_limit, uint32_t num_nodes_to_cache, const diskann::SimHostProfile &host,
         const diskann::SimSSDParams &ssd, const diskann::SimPolicy &policy, uint64_t seed, const std::string &out)
 {
     T *query = nullptr;
@@ -72,6 +72,13 @@ int run(const std::string &prefix, const std::string &query_file, const std::str
     diskann::PQFlashIndex<T> index(reader, diskann::Metric::L2);
     if (index.load(1, prefix.c_str()) != 0)
         return -1;
+    if (num_nodes_to_cache > 0)
+    { // same cache as search_disk_index: BFS levels around the medoid(s)
+        std::vector<uint32_t> node_list;
+        std::cout << "Caching " << num_nodes_to_cache << " nodes around medoid(s)" << std::endl;
+        index.cache_bfs_levels(num_nodes_to_cache, node_list);
+        index.load_cache_list(node_list);
+    }
     std::vector<uint64_t> ids64(nq * K);
     std::vector<float> dists(nq * K);
     std::vector<diskann::SimQueryResult> pq;
@@ -103,7 +110,8 @@ int run(const std::string &prefix, const std::string &query_file, const std::str
              << r.rounds << ',' << r.reads << ',' << r.buffer_hits << ',' << r.prefetch_waits << '\n';
     }
     std::ostringstream o;
-    o << "queries=" << nq << "\nworkers=" << workers << "\nL=" << L << "\nW=" << W << "\nnominate=" << policy.nominate
+    o << "queries=" << nq << "\nworkers=" << workers << "\nL=" << L << "\nW=" << W
+      << "\nnum_nodes_to_cache=" << num_nodes_to_cache << "\nnominate=" << policy.nominate
       << "\navoid_busy=" << policy.avoid_busy << "\nwait_threshold_us=" << policy.wait_threshold_us
       << "\nprefetch_buffer=" << policy.prefetch_buffer << "\nprefetch_queue_limit=" << policy.prefetch_queue_limit
       << "\nhit_us=" << ssd.hit_us << "\nhost_xfer_us=" << ssd.host_xfer_us << "\nseed=" << seed << "\nsim_time_s=" << s.end_us / 1e6
@@ -117,7 +125,8 @@ int run(const std::string &prefix, const std::string &query_file, const std::str
       << "\nflash_reads_critical=" << s.flash_reads << "\nbuffer_hits=" << s.buffer_hits
       << "\nprefetch_waits=" << s.prefetch_waits << "\nprefetch_promoted=" << s.prefetch_promoted
       << "\nprefetch_issued=" << s.prefetch_issued << "\nprefetch_completed=" << s.prefetch_completed
-      << "\nprefetch_dropped=" << s.prefetch_dropped
+      << "\nprefetch_dropped=" << s.prefetch_dropped << "\ncache_hits=" << s.cache_hits
+      << "\ncache_only_rounds=" << s.cache_only_rounds
       << "\nunit_utilization=" << s.unit_busy_us / (ssd.units * s.end_us) << "\n";
     std::ofstream(out + "_summary.txt") << o.str();
     std::cout << o.str();
@@ -130,6 +139,7 @@ int main(int argc, char **argv)
     std::string data_type, prefix, query_file, gt_file, profile, out;
     uint32_t K, L, W, workers;
     uint64_t nq, seed;
+    uint32_t cache_nodes;
     diskann::SimSSDParams ssd;
     diskann::SimPolicy pol;
     bool no_avoid = false;
@@ -142,6 +152,7 @@ int main(int argc, char **argv)
         "beamwidth,W", po::value(&W)->default_value(4), "W")("workers,T", po::value(&workers)->default_value(16),
                                                               "concurrent search workers")(
         "num_queries", po::value(&nq)->default_value(0), "0 = all")(
+        "num_nodes_to_cache", po::value(&cache_nodes)->default_value(0), "node cache (BFS around medoid), as search_disk_index")(
         "host_profile", po::value(&profile)->required(), "host time profile (make_host_profile.py)")(
         "out", po::value(&out)->required(), "output prefix")("seed", po::value(&seed)->default_value(1), "rng seed")(
         "nominate", po::value(&pol.nominate)->default_value(0), "0 = original beam; k = host nominates top-k")(
@@ -172,11 +183,11 @@ int main(int argc, char **argv)
     pol.avoid_busy = !no_avoid;
     auto host = load_profile(profile);
     if (data_type == "uint8")
-        return run<uint8_t>(prefix, query_file, gt_file, K, L, W, workers, nq, host, ssd, pol, seed, out);
+        return run<uint8_t>(prefix, query_file, gt_file, K, L, W, workers, nq, cache_nodes, host, ssd, pol, seed, out);
     if (data_type == "int8")
-        return run<int8_t>(prefix, query_file, gt_file, K, L, W, workers, nq, host, ssd, pol, seed, out);
+        return run<int8_t>(prefix, query_file, gt_file, K, L, W, workers, nq, cache_nodes, host, ssd, pol, seed, out);
     if (data_type == "float")
-        return run<float>(prefix, query_file, gt_file, K, L, W, workers, nq, host, ssd, pol, seed, out);
+        return run<float>(prefix, query_file, gt_file, K, L, W, workers, nq, cache_nodes, host, ssd, pol, seed, out);
     std::cerr << "unknown data_type\n";
     return -1;
 }
